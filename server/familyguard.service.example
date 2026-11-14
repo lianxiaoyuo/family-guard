@@ -1,0 +1,25 @@
+[Unit]
+Description=Family Guard location sharing API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=familyguard
+Group=familyguard
+WorkingDirectory=/opt/familyguard
+Environment=FG_SINGLE_FAMILY=1
+EnvironmentFile=/etc/familyguard/settings.env
+EnvironmentFile=-/etc/familyguard/alerts.env
+ExecStart=/opt/familyguard/familyguard-server -listen 127.0.0.1:8088 -data /var/lib/familyguard
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/familyguard
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

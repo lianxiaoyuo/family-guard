@@ -1,0 +1,35 @@
+# Android IDE, local build and credentials
+.gradle/
+.idea/
+local.properties
+**/build/
+*.iml
+*.jks
+*.keystore
+# Go server runtime data and personal location history
+server/data/
+server/local-test-data/
+server/familyguard-server
+server/familyguard-server.exe
+*.db
+*.db-shm
+*.db-wal
+families.json
+families.json.migrated
+
+# Contains private push topic and optional credentials
+server/local-alert-settings.cmd
+server/local-test-data/
+# V6 server container runtime credentials and data
+deploy/.env
+deploy/data/
+server/data/
+*.keystore
+*.jks
+
+# Local AMap Android SDK key (restricted by package name + signing SHA1)
+android/amap-key.properties
+
+keystore.properties
+keystore/
+*.p12

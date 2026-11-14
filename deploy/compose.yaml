@@ -1,0 +1,31 @@
+# Use this for a NEW installation, or migrate /var/lib/familyguard data first.
+# Never run it concurrently with the existing systemd FamilyGuard API.
+services:
+  familyguard:
+    build:
+      context: ../server
+    restart: unless-stopped
+    environment:
+      FG_SINGLE_FAMILY: "1"
+      FG_SETUP_TOKEN: ${FG_SETUP_TOKEN:?Set a 64+ character random secret in deploy/.env}
+      FG_ALERT_URL: ${FG_ALERT_URL:-}
+      FG_ALERT_TOKEN: ${FG_ALERT_TOKEN:-}
+    ports:
+      - "127.0.0.1:8088:8088"  # not accessible directly from the Internet
+    volumes:
+      - familyguard_data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8088/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+volumes:
+  familyguard_data: {}

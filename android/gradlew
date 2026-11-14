@@ -1,0 +1,12 @@
+#!/usr/bin/env sh
+set -eu
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+JAR="$ROOT/gradle/wrapper/gradle-wrapper.jar"
+SUM=2db75c40782f5e8ba1fc278a5574bab070adccb2d21ca5a6e5ed840888448046
+if [ ! -f "$JAR" ]; then
+  echo "Downloading official Gradle 8.11.1 wrapper..."
+  curl -fsSL https://services.gradle.org/distributions/gradle-8.11.1-wrapper.jar -o "$JAR.tmp"
+  echo "$SUM  $JAR.tmp" | sha256sum -c -
+  mv "$JAR.tmp" "$JAR"
+fi
+exec java -classpath "$JAR" org.gradle.wrapper.GradleWrapperMain "$@"

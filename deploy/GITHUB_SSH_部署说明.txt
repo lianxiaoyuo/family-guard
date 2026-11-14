@@ -1,0 +1,47 @@
+FamilyGuard V6.0.1.2 — GitHub 提交 + Ubuntu SSH 部署
+
+目标 GitHub： https://github.com/lianxiaoyuo/protectApp
+目标服务器： 1.92.104.9
+部署方式：Windows 本机 Git push + OpenSSH/SCP 上传 Go Linux 二进制 + Ubuntu systemd 安装。
+
+一、先准备
+1. 使用 FamilyGuard_V6.0.1.2_Release_Signing_Ready.zip 解压出的完整 FamilyGuard_V6_Complete 目录。
+2. 确保 PowerShell 能运行 git.exe、ssh.exe、scp.exe。
+3. 确保 GitHub 账号已通过 Git Credential Manager 登录；如果没有，可先运行 gh auth login（需要已安装 GitHub CLI）。
+4. 确认服务器 SSH 用户名、端口和私钥。不要把私钥或密码发给任何人。
+
+二、先只提交 GitHub（不动服务器）
+在 FamilyGuard_V6_Complete 根目录执行：
+
+powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy\PUSH_GITHUB_AND_DEPLOY_WINDOWS.ps1 -PushOnly
+
+此阶段带 -PushOnly，不需要 SSH 用户名，也不会连接或修改服务器。
+成功后确认 GitHub main 出现 FamilyGuard V6.0.1.2 源码提交。
+
+三、再部署服务器
+同一个目录执行（去掉 -PushOnly）：
+
+powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy\PUSH_GITHUB_AND_DEPLOY_WINDOWS.ps1 -Login root
+
+如需指定私钥：
+
+powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy\PUSH_GITHUB_AND_DEPLOY_WINDOWS.ps1 -Login root -IdentityFile "$env:USERPROFILE\.ssh\id_ed25519"
+
+如 SSH 端口不是 22，增加： -SshPort 你的端口
+脚本会先检查服务器系统、8088 端口、旧服务和数据目录，要求输入 YES 才继续。安装器会备份旧程序、service unit 和 /var/lib/familyguard 数据，再更新 systemd 服务并检查 127.0.0.1:8088/healthz。
+
+四、安全边界
+- 公开仓库只提交源码和部署脚本。
+- android/local.properties、android/amap-key.properties、keystore.properties、JKS、deploy/.env、家庭数据库、编译二进制、APK 均不得提交。
+- 部署脚本不会修改 Nginx，不会开放公网 8088，不会自动改动其他网站。
+- SCP 直接从本地上传部署所需文件，服务器不需要访问 GitHub。
+- 首次安装时终端会显示 FG_SETUP_TOKEN，只保存在自己的密码管理器，不要贴到聊天记录。
+
+五、HTTPS 是正式使用的必需条件
+App 的正式版只允许 HTTPS 服务器地址。服务端安装成功后，仍需把专用域名 DNS 指向 1.92.104.9，在现有 Nginx 中增加独立虚拟主机并申请证书，反向代理到 127.0.0.1:8088。不要覆盖原 Nginx 配置。公网仅开放 443，不开放 8088。
+
+外部验收：
+
+curl.exe -fsS https://你的域名/healthz
+
+再在两部手机 App 中分别填入 https://你的域名，完成家长/孩子配对和定位验收。

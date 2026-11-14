@@ -1,0 +1,117 @@
+plugins { id 'com.android.application' }
+
+// AMap Android SDK Key is client-side and is restricted by package + signing SHA1 in AMap Console.
+// Priority: -PAMAP_KEY, AMAP_KEY environment variable, amap-key.properties, local.properties.
+def amapOptions = new Properties()
+def amapKeyFile = rootProject.file('amap-key.properties')
+if (amapKeyFile.exists()) {
+    amapKeyFile.withInputStream { amapOptions.load(it) }
+}
+def localOptions = new Properties()
+def localPropsFile = rootProject.file('local.properties')
+if (localPropsFile.exists()) {
+    localPropsFile.withInputStream { localOptions.load(it) }
+}
+def amapKey = (project.findProperty('AMAP_KEY') ?: System.getenv('AMAP_KEY') ?:
+        localOptions.getProperty('AMAP_KEY') ?: amapOptions.getProperty('AMAP_KEY') ?: '').trim()
+if (amapKey && !(amapKey ==~ /[A-Za-z0-9]+/)) {
+    throw new GradleException('AMAP_KEY 只能包含字母和数字')
+}
+
+// Release signing credentials stay local in android/keystore.properties (gitignored).
+// Never commit the keystore or this properties file.
+def releaseSigningOptions = new Properties()
+def releaseSigningFile = rootProject.file('keystore.properties')
+if (releaseSigningFile.exists()) {
+    releaseSigningFile.withInputStream { releaseSigningOptions.load(it) }
+}
+def releaseStoreFile = (System.getenv('FG_RELEASE_STORE_FILE') ?: releaseSigningOptions.getProperty('storeFile') ?: '').trim()
+def releaseStoreType = (System.getenv('FG_RELEASE_STORE_TYPE') ?: releaseSigningOptions.getProperty('storeType') ?: 'JKS').trim()
+def releaseStorePassword = System.getenv('FG_RELEASE_STORE_PASSWORD') ?: releaseSigningOptions.getProperty('storePassword')
+def releaseKeyAlias = (System.getenv('FG_RELEASE_KEY_ALIAS') ?: releaseSigningOptions.getProperty('keyAlias') ?: '').trim()
+def releaseKeyPassword = System.getenv('FG_RELEASE_KEY_PASSWORD') ?: releaseSigningOptions.getProperty('keyPassword')
+def releaseSigningConfigured = [releaseStoreFile, releaseStorePassword, releaseKeyAlias, releaseKeyPassword].every { it != null && !it.toString().trim().isEmpty() }
+
+android {
+    namespace 'com.familyguard.app'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.familyguard.app'
+        minSdk 26
+        targetSdk 35
+        versionCode 16
+        versionName '6.0.1-amap-rc1'
+        manifestPlaceholders = [AMAP_KEY: amapKey]
+        buildConfigField 'String', 'AMAP_KEY', '"' + amapKey + '"'
+    }
+    buildFeatures { buildConfig true }
+    signingConfigs {
+        release {
+            // A fallback path allows Gradle sync before the user creates the keystore.
+            // Release tasks are blocked by verifyReleaseSigning until real credentials exist.
+            storeFile rootProject.file(releaseStoreFile ?: 'keystore/familyguard-release.jks')
+            storeType releaseStoreType
+            storePassword releaseStorePassword ?: ''
+            keyAlias releaseKeyAlias ?: 'familyguard'
+            keyPassword releaseKeyPassword ?: ''
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+    }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+}
+
+// AMap 3D Map + Location + Search are supplied by this combined official SDK artifact.
+// One Android-platform Key (package + signing SHA1 restricted) is used by both child location
+// and parent in-app map. Do not add duplicate location/map AARs or MapLibre.
+dependencies {
+    implementation 'com.amap.api:3dmap-location-search:11.3.100_loc11.3.000_sea9.8.1'
+    implementation 'androidx.core:core:1.13.1'
+}
+
+tasks.register('verifyAmapConfiguration') {
+    group = 'verification'
+    description = 'Verifies the AMap Android Key injection and SDK manifest wiring without printing the Key.'
+    doLast {
+        if (!amapKey) throw new GradleException('缺少 AMAP_KEY：请检查 android/amap-key.properties')
+        if (android.defaultConfig.applicationId != 'com.familyguard.app')
+            throw new GradleException('applicationId 与高德控制台绑定包名不一致')
+        def manifestText = file('src/main/AndroidManifest.xml').getText('UTF-8')
+        if (!manifestText.contains('com.amap.api.v2.apikey') || !manifestText.contains('${AMAP_KEY}'))
+            throw new GradleException('AndroidManifest.xml 缺少高德 Key meta-data 占位符')
+        if (!file('src/main/java/com/familyguard/app/AmapTracker.java').exists() ||
+            !file('src/main/java/com/familyguard/app/AmapPrivacy.java').exists())
+            throw new GradleException('高德定位或隐私初始化类缺失')
+        println('AMap config PASS: Android Key loaded (masked), applicationId=' + android.defaultConfig.applicationId)
+        println('AMap map + location SDK dependency and manifest placeholder are present.')
+    }
+}
+
+
+tasks.register('verifyReleaseSigning') {
+    group = 'verification'
+    description = 'Fails closed unless a local release keystore and credentials are configured.'
+    doLast {
+        if (!releaseSigningConfigured) {
+            throw new GradleException('缺少 Release 签名配置。请先运行 android/GENERATE_RELEASE_SHA1_WINDOWS.ps1 生成 keystore.properties 和本地签名文件。')
+        }
+        def signingKeystore = rootProject.file(releaseStoreFile)
+        if (!signingKeystore.isFile()) {
+            throw new GradleException('Release keystore 文件不存在：' + signingKeystore.absolutePath)
+        }
+        if (!(releaseStoreType in ['JKS', 'PKCS12'])) {
+            throw new GradleException('不支持的 keystore storeType：' + releaseStoreType)
+        }
+        println('Release signing configuration PASS (passwords and private key are not printed).')
+        println('Keystore file exists; alias=' + releaseKeyAlias + '; type=' + releaseStoreType)
+    }
+}
+
+tasks.matching { it.name in ['assembleRelease', 'bundleRelease'] }.configureEach {
+    dependsOn tasks.named('verifyReleaseSigning')
+}
