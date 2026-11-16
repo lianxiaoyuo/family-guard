@@ -744,6 +744,7 @@ func (a *App) handler() http.Handler {
 		write(w, 200, map[string]bool{"ok": true})
 	})
 	registerGuardRoutes(mux, a)
+	registerAppUpdateRoutes(mux, a.dir)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")

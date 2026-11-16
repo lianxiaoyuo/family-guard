@@ -40,8 +40,8 @@ android {
         applicationId 'com.familyguard.app'
         minSdk 26
         targetSdk 35
-        versionCode 16
-        versionName '6.0.1-amap-rc1'
+        versionCode 18
+        versionName '7.0.0-alpha2'
         manifestPlaceholders = [AMAP_KEY: amapKey]
         buildConfigField 'String', 'AMAP_KEY', '"' + amapKey + '"'
     }

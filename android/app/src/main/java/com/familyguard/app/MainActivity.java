@@ -40,9 +40,9 @@ public class MainActivity extends Activity {
     private final ExecutorService network=Executors.newSingleThreadExecutor();
     private final Handler handler=new Handler(Looper.getMainLooper());
     private LinearLayout body;
-    private EditText serverField,setupTokenField,codeField,nameField,recoveryField;
+    private EditText setupTokenField,codeField,nameField,recoveryField;
+    private String setupMode="";
     private TextView parentStatus, childStatus, pairText, guardStatus, mediaStatus;
-    private EditText fenceLatField,fenceLonField,fenceRadiusField;
     private String shownMediaRequest="", activeMediaID="", activeMediaKind="", lastGuardEvent="";
     private File captureFile;
     private MediaRecorder audioRecorder;
@@ -65,7 +65,8 @@ public class MainActivity extends Activity {
     private final List<Polyline> routeLines=new ArrayList<>();
     private Bundle pendingMapState;
     private TextView historyStatus;
-    private boolean mapCentered=false, mapReady=false;
+    private String latestDiagnostics="";
+    private boolean mapCentered=false, mapReady=false, followChild=true;
     private boolean started=false,loading=false;
     private final Runnable poll=new Runnable(){@Override public void run(){
         if(started && "parent".equals(Prefs.role(MainActivity.this))) {
@@ -73,9 +74,19 @@ public class MainActivity extends Activity {
         }
     }};
     int dp(float n){return (int)(n*getResources().getDisplayMetrics().density+0.5f);}
-    @Override public void onCreate(Bundle b){super.onCreate(b);pendingMapState=b;getWindow().setStatusBarColor(Color.rgb(248,250,254));getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);render();}
+    @Override public void onCreate(Bundle b){
+        super.onCreate(b);
+        pendingMapState=b;
+        getWindow().setStatusBarColor(Color.rgb(248,250,254));
+        getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
+        render();
+        UpdateManager.check(this,false);
+        maybePromptSafetyNotifications();
+    }
     @Override protected void onResume(){super.onResume();started=true;if(mapView!=null)mapView.onResume();handler.removeCallbacks(poll);handler.post(poll);
-        handler.removeCallbacks(childMediaPoll);handler.post(childMediaPoll);}
+        handler.removeCallbacks(childMediaPoll);handler.post(childMediaPoll);
+        if("parent".equals(Prefs.role(this)))handler.post(this::maybePromptSafetyNotifications);
+    }
     @Override protected void onPause(){started=false;handler.removeCallbacks(poll);handler.removeCallbacks(childMediaPoll);if(mapView!=null)mapView.onPause();super.onPause();}
     @Override public void onLowMemory(){super.onLowMemory();if(mapView!=null)mapView.onLowMemory();}
     @Override protected void onDestroy(){network.shutdownNow();stopAudio(false);releaseMap();super.onDestroy();}
@@ -86,14 +97,23 @@ public class MainActivity extends Activity {
     private void releaseMap(){
         clearRouteLines();
         if(mapView!=null){try{mapView.onPause();mapView.onDestroy();}catch(Exception ignored){}mapView=null;}
-        map=null;marker=null;accuracyCircle=null;mapCentered=false;mapReady=false;lastRenderedPointId="";
+        map=null;marker=null;accuracyCircle=null;mapCentered=false;mapReady=false;followChild=true;lastRenderedPointId="";
     }
     private void clearRouteLines(){
         for(Polyline line:routeLines){try{line.remove();}catch(RuntimeException ignored){}}
         routeLines.clear();
     }
     private GradientDrawable bg(int color,int stroke){
-        GradientDrawable d=new GradientDrawable();d.setColor(color);d.setCornerRadius(dp(14));if(stroke!=0)d.setStroke(dp(1),stroke);return d;
+        GradientDrawable d=new GradientDrawable();d.setColor(color);d.setCornerRadius(dp(18));
+        if(stroke!=0)d.setStroke(dp(1),stroke);return d;
+    }
+    private void cardTitle(String heading,String summary){
+        TextView t=text(heading,19,Color.rgb(20,46,83),true);
+        LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,-2);
+        lp.topMargin=dp(14);lp.bottomMargin=dp(4);
+        t.setLayoutParams(lp);t.setPadding(dp(12),dp(14),dp(12),dp(12));
+        t.setBackground(bg(Color.rgb(231,241,252),0));add(t);
+        if(summary!=null&&!summary.isEmpty())line(summary);
     }
     private void add(View v){body.addView(v);}
     private TextView text(String value,int size,int color,boolean bold){
@@ -105,8 +125,10 @@ public class MainActivity extends Activity {
     private void title(String s){TextView t=text(s,22,Color.rgb(22,34,65),true);t.setPadding(0,dp(16),0,dp(14));add(t);}
     private Button btn(String label,boolean primary,Runnable cb){
         Button b=new Button(this);b.setText(label);b.setAllCaps(false);b.setTextSize(15);b.setTypeface(null,Typeface.BOLD);
-        b.setTextColor(primary?Color.WHITE:Color.rgb(36,81,173));b.setBackground(bg(primary?Color.rgb(37,105,240):Color.rgb(233,240,254),0));
-        LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,dp(48));p.bottomMargin=dp(10);b.setLayoutParams(p);
+        b.setTextColor(primary?Color.WHITE:Color.rgb(23,73,148));
+        b.setBackground(bg(primary?Color.rgb(30,97,210):Color.WHITE,primary?0:Color.rgb(222,232,246)));
+        b.setElevation(dp(primary?3:1));
+        LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,dp(52));p.bottomMargin=dp(10);b.setLayoutParams(p);
         b.setOnClickListener(v->cb.run());add(b);return b;
     }
     private EditText input(String hint,String value){
@@ -116,57 +138,75 @@ public class MainActivity extends Activity {
     }
     private void show(String message){Toast.makeText(this,message,Toast.LENGTH_LONG).show();}
     private void render(){
-        guardStatus=null;mediaStatus=null;fenceLatField=null;fenceLonField=null;fenceRadiusField=null;
+        guardStatus=null;mediaStatus=null;
         releaseMap();
         ScrollView scroll=new ScrollView(this);scroll.setFillViewport(true);scroll.setBackgroundColor(Color.rgb(248,250,254));
         body=new LinearLayout(this);body.setOrientation(LinearLayout.VERTICAL);body.setPadding(dp(20),dp(14),dp(20),dp(40));scroll.addView(body);setContentView(scroll);
-        add(text("家庭守护  /  Family Guard",14,Color.rgb(37,105,240),true));
+        TextView brand=text("●  FAMILYGUARD  ·  家庭守护",13,Color.rgb(37,105,240),true);
+        brand.setPadding(dp(4),dp(8),dp(4),dp(12));add(brand);
         if(Prefs.role(this).isEmpty())setup();
         else if("parent".equals(Prefs.role(this)))parent();
         else child();
     }
     private void setup(){
-        title("家庭安全守护 · V6");
-        line("首次配对需明确启用持续位置共享；之后位置与电子围栏自动工作。远程录音/拍摄请求需要本机确认，不能通过安装来代替系统许可。");
-        title("第一步 · 配置服务器");
-        serverField=input("https://你的域名（必须 HTTPS）",Prefs.get(this,"server"));
-        setupTokenField=input("首次部署密钥（仅创建家庭时使用）", "");
+        title("家庭安全守护");
+        line("家庭服务器已自动配置，无需填写网址。首次使用请根据手机身份选择入口。共享位置需在孩子手机上明确授权，可以随时停止。" );
+        if ("parent".equals(setupMode)) {
+            setupParent();
+        } else if ("child".equals(setupMode)) {
+            setupChild();
+        } else {
+            title("请选择这部手机的身份");
+            btn("我是家长 · 创建或恢复家庭",true,()->{setupMode="parent";render();});
+            btn("我是孩子 · 输入配对码",false,()->{setupMode="child";render();});
+        }
+    }
+    private void setupParent(){
+        title("家长端 · 首次创建家庭");
+        line("首次创建需要部署时生成的初始化密钥。此密钥只在创建家庭时使用，不保存在 App 内。" );
+        setupTokenField=input("首次部署初始化密钥", "");
         setupTokenField.setTransformationMethod(android.text.method.PasswordTransformationMethod.getInstance());
-        line("首次创建家庭时，输入服务器部署脚本生成的一次性初始化密钥；不会储存在手机上。已创建家庭的设备不再需要它。");
-        line(BuildConfig.DEBUG?"Debug APK 可用局域网 HTTP 测试；正式版必须 HTTPS。":"正式版本仅支持 HTTPS 服务器。");
-        title("第二步 · 选择当前手机角色");
-        btn("我是家长 · 创建家庭并获取配对码",true,()->{
-            if(!saveServer())return;
+        btn("创建家庭并获取配对码",true,()->{
             final String initialSetupKey=setupTokenField.getText().toString().trim();
+            if(initialSetupKey.isEmpty()){show("请输入初始化密钥");return;}
             request(()->Api.call(this,"POST","/v1/families",new JSONObject(),initialSetupKey),r->{
                 Prefs.setIdentity(this,"parent",r.getString("token"));render();
                 saveDisplayedPairCode(r.optString("pairCode"));
                 showRecoveryKey(r.getString("recoveryKey"));
             });
         });
-        line("孩子端请先从家长端获取配对码。");
-        codeField=input("输入家长提供的 8 位配对码","");
-        nameField=input("孩子昵称（例如：小宝）","");
         title("已有家庭 · 恢复家长访问");
-        line("仅使用创建家庭或上次恢复时保存的 64 位恢复密钥。恢复后旧家长令牌和旧恢复密钥立即失效。");
-        recoveryField=input("家长恢复密钥（64 位）","");
+        line("只有在家长手机遗失或更换、无法访问原账号时才使用恢复密钥。恢复后旧家长令牌会失效。" );
+        recoveryField=input("64 位家长恢复密钥","");
         recoveryField.setTransformationMethod(android.text.method.PasswordTransformationMethod.getInstance());
         btn("恢复家长账号",false,()->{
-            if(!saveServer())return;
             String key=recoveryField.getText().toString().trim();
             if(!key.matches("[0-9a-fA-F]{64}")){show("请输入完整的 64 位恢复密钥");return;}
             request(()->Api.call(this,"POST","/v1/recover",new JSONObject().put("recoveryKey",key),null),r->{
                 Prefs.setIdentity(this,"parent",r.getString("token"));render();showRecoveryKey(r.getString("recoveryKey"));
             });
         });
-        btn("我是孩子 · 授权配对",false,()->{
-            if(!saveServer())return;
-            String code=codeField.getText().toString().trim().toUpperCase(Locale.ROOT),name=nameField.getText().toString().trim();
-            if(code.length()!=8||name.isEmpty()){show("请输入 8 位配对码和昵称");return;}
+        btn("返回选择身份",false,()->{setupMode="";render();});
+    }
+    private void setupChild(){
+        title("孩子端 · 授权加入家庭");
+        line("请从家长手机获取 8 位配对码。配对码有效期 10 分钟；孩子端无需部署密钥。" );
+        codeField=input("家长提供的 8 位配对码","");
+        nameField=input("孩子昵称","");
+        line("点击加入表示你同意在本机开启持续位置共享；首次还需授予系统定位和通知权限。共享期间有常驻通知，可随时停止。拍照、录音、录像不会因配对而自动授权。");
+        btn("同意持续共享位置并加入家庭",true,()->{
+            String code=codeField.getText().toString().trim().toUpperCase(Locale.ROOT);
+            String name=nameField.getText().toString().trim();
+            if(code.length()!=8||name.isEmpty()){show("请输入 8 位配对码和孩子昵称");return;}
             request(()->Api.call(this,"POST","/v1/join",new JSONObject().put("code",code).put("name",name),null),r->{
-                Prefs.setIdentity(this,"child",r.getString("token"));render();
+                Prefs.setIdentity(this,"child",r.getString("token"));
+                render();
+                // The join button explicitly authorizes ongoing location sharing;
+                // Android OS permissions are still required and never bypassed.
+                beginTracking();
             });
         });
+        btn("返回选择身份",false,()->{setupMode="";render();});
     }
     private void saveDisplayedPairCode(String code){
         long until=System.currentTimeMillis()+600000L;
@@ -192,25 +232,6 @@ public class MainActivity extends Activity {
                     show("已复制，请粘贴到受保护的位置并清除剪贴板");
                 }).show();
     }
-    private boolean saveServer(){
-        String s=serverField.getText().toString().trim().replaceAll("/+$","");
-        if(!validateServer(s))return false;
-        Prefs.put(this,"server",s);return true;
-    }
-    private boolean validateServer(String s){
-        try { ServerAddress.normalize(s, BuildConfig.DEBUG); return true; }
-        catch (IllegalArgumentException ex) { show(ex.getMessage()); return false; }
-    }
-    private void editServer(){
-        EditText field=new EditText(this);field.setSingleLine(true);field.setText(Prefs.get(this,"server"));
-        field.setSelectAllOnFocus(true);field.setPadding(dp(20),dp(12),dp(20),dp(12));
-        new AlertDialog.Builder(this).setTitle("服务器地址")
-            .setMessage("修改地址不会迁移家庭数据。只有迁移原服务器数据后，原配对凭证才可继续使用。")
-            .setView(field).setNegativeButton("取消",null)
-            .setPositiveButton("保存",(d,w)->{String s=field.getText().toString().trim().replaceAll("/+$","");
-                if(validateServer(s)){Prefs.put(this,"server",s);loading=false;render();}
-            }).show();
-    }
     private interface Job {JSONObject execute() throws Exception;}
     private interface Done {void accept(JSONObject r) throws Exception;}
     private void request(Job job,Done done){
@@ -219,6 +240,20 @@ public class MainActivity extends Activity {
                 try{done.accept(r);}catch(Exception ex){show("解析失败："+ex.getMessage());}
             });}catch(Exception ex){runOnUiThread(()->show("请求失败："+ex.getMessage()));}
         });
+    }
+    // App defaults safety events to enabled, but Android 13+ owns the final permission.
+    // Ask only once during onboarding; after denial, Settings remains available.
+    private void maybePromptSafetyNotifications(){
+        if(!"parent".equals(Prefs.role(this)) || Build.VERSION.SDK_INT<33 ||
+                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)==PackageManager.PERMISSION_GRANTED)return;
+        if(Prefs.store(this).getBoolean("safety_notification_prompted",false))return;
+        Prefs.store(this).edit().putBoolean("safety_notification_prompted",true).apply();
+        new AlertDialog.Builder(this)
+                .setTitle("开启孩子安全提醒")
+                .setMessage("为及时提醒 SOS 和进出安全区，建议允许通知。Android 系统需要你确认一次授权；拒绝后可随时在系统设置开启。")
+                .setPositiveButton("允许通知",(d,w)->requestPermissions(
+                        new String[]{Manifest.permission.POST_NOTIFICATIONS},401))
+                .setNegativeButton("暂不允许",null).show();
     }
     private void askAmapConsent(Runnable accepted){askAmapConsent(accepted,null);}
     private void askAmapConsent(Runnable accepted,Runnable declined){
@@ -255,8 +290,20 @@ public class MainActivity extends Activity {
             // Both MapsInitializer and AMapLocationClient privacy interfaces must be updated
             // before creating the map or location client.
             AmapPrivacy.initialize(this);
-            mapView=new MapView(this);
-            LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,dp(390));
+            mapView=new MapView(this){
+                @Override public boolean dispatchTouchEvent(MotionEvent event){
+                    // Called before the SDK's nested map renderer processes gestures.
+                    if(event.getActionMasked()==MotionEvent.ACTION_DOWN){
+                        if(getParent()!=null)getParent().requestDisallowInterceptTouchEvent(true);
+                        followChild=false;
+                    }else if(event.getActionMasked()==MotionEvent.ACTION_UP ||
+                            event.getActionMasked()==MotionEvent.ACTION_CANCEL){
+                        if(getParent()!=null)getParent().requestDisallowInterceptTouchEvent(false);
+                    }
+                    return super.dispatchTouchEvent(event);
+                }
+            };
+            LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,dp(460));
             lp.bottomMargin=dp(12);
             mapView.setLayoutParams(lp);
             body.addView(mapView);
@@ -268,6 +315,9 @@ public class MainActivity extends Activity {
             map.setTrafficEnabled(false);
             map.setOnMapLoadedListener(()->android.util.Log.i("FamilyGuard.AMap","AMap map tiles loaded"));
             map.getUiSettings().setZoomControlsEnabled(true);
+            map.getUiSettings().setZoomGesturesEnabled(true);
+            map.getUiSettings().setScrollGesturesEnabled(true);
+            map.getUiSettings().setRotateGesturesEnabled(true);
             map.getUiSettings().setCompassEnabled(true);
             map.getUiSettings().setScaleControlsEnabled(true);
             mapReady=true;
@@ -286,6 +336,13 @@ public class MainActivity extends Activity {
         }
         return new LatLng(lat,lon);
     }
+    private String locationSourceLabel(String provider){
+        if("gps".equals(provider))return "GNSS 卫星定位（可能包含北斗、GPS 等）";
+        if("amap".equals(provider))return "高德融合定位";
+        if("fused".equals(provider))return "Android 系统融合定位";
+        if("network".equals(provider))return "网络定位";
+        return "未识别";
+    }
     private void showLatestOnMap(JSONObject p,long ageMs){
         if(map==null||!mapReady||p==null)return;
         double lat=p.optDouble("lat",Double.NaN),lon=p.optDouble("lon",Double.NaN);
@@ -293,8 +350,8 @@ public class MainActivity extends Activity {
         String type=p.optString("coordType","wgs84");
         if(!"gcj02".equals(type)&&!"wgs84".equals(type))return;
         LatLng point=toAmapPoint(lat,lon,type);
-        if(marker==null)marker=map.addMarker(new MarkerOptions().position(point).title("孩子最新位置").snippet("定位来源："+p.optString("provider","未知")));
-        else{marker.setPosition(point);marker.setSnippet("定位来源："+p.optString("provider","未知"));}
+        if(marker==null)marker=map.addMarker(new MarkerOptions().position(point).title("孩子最新位置").snippet("定位来源："+locationSourceLabel(p.optString("provider",""))));
+        else{marker.setPosition(point);marker.setSnippet("定位来源："+locationSourceLabel(p.optString("provider","")));}
         double radius=Math.min(3000d,Math.max(1d,p.optDouble("accuracy",100d)));
         if(accuracyCircle==null){
             accuracyCircle=map.addCircle(new CircleOptions().center(point).radius(radius)
@@ -302,7 +359,7 @@ public class MainActivity extends Activity {
                     .fillColor(Color.argb(38,40,116,240)).zIndex(5f));
         }else{accuracyCircle.setCenter(point);accuracyCircle.setRadius(radius);}
         if(!mapCentered){map.moveCamera(CameraUpdateFactory.newLatLngZoom(point,17f));mapCentered=true;}
-        else map.animateCamera(CameraUpdateFactory.newLatLng(point));
+        else if(followChild) map.animateCamera(CameraUpdateFactory.newLatLng(point));
     }
     private void addHistorySegment(List<LatLng> segment){
         if(map==null||segment==null||segment.size()<2)return;
@@ -310,43 +367,80 @@ public class MainActivity extends Activity {
                 .color(Color.rgb(5,153,122)).geodesic(true).zIndex(4f)));
     }
     private void parent(){
-        title("实时定位 · 家长端");
-        line("服务器："+Prefs.get(this,"server"));
-        pairText=text("正在连接…",16,Color.rgb(38,62,103),true);add(pairText);
+        title("孩子的位置");
+        pairText=text("正在连接孩子设备…",17,Color.rgb(30,69,129),true);add(pairText);
+        // The live map is the primary control, not a section buried below diagnostics.
         installLiveMap();
-        line("家长端地图和孩子端融合定位均通过高德 Android SDK 提供；地图显示坐标统一转换为高德 GCJ-02 坐标系。实际加载状态以 SDK 回调为准。");
-        parentStatus=text("正在等待最新位置…",16,Color.rgb(32,51,83),true);add(parentStatus);
-        btn("在高德查看当前坐标",false,this::openMap);
-        title("轨迹回放");
-        line("手动加载历史轨迹；绿色线条显示经系统采集并成功上传的坐标，不表示手机离线时有实时数据。");
-        historyStatus=text("尚未加载历史轨迹",14,Color.rgb(40,64,90),false);add(historyStatus);
-        btn("查看最近 1 小时轨迹",false,()->loadHistory(1));
-        btn("查看最近 6 小时轨迹",false,()->loadHistory(6));
-        btn("查看最近 24 小时轨迹",false,()->loadHistory(24));
-        btn("修改服务器地址",false,this::editServer);
-        btn("生成孩子端配对码",false,()->request(()->Api.call(this,"POST","/v1/pair",new JSONObject(),Prefs.token(this)),r->saveDisplayedPairCode(r.optString("pairCode"))));
-        title("电子围栏 / SOS / 媒体请求");
-        line("围栏使用 WGS84 经纬度。请输入学校、家等安全区域中心；以当前孩子位置作为中心也可。进出提醒需连续可信坐标确认。") ;
-        fenceLatField=input("中心纬度，例如 39.912","");
-        fenceLonField=input("中心经度，例如 116.397","");
-        fenceRadiusField=input("围栏半径（米，80–2000）","150");
-        btn("使用孩子最新位置作为围栏中心",false,()->{
-            if(latest==null){show("尚无最新位置");return;}
-            double lat=latest.optDouble("lat",Double.NaN),lon=latest.optDouble("lon",Double.NaN);
-            if("gcj02".equals(latest.optString("coordType"))){double[] v=CoordinateReference.gcjToWgs(lat,lon);lat=v[0];lon=v[1];}
-            fenceLatField.setText(String.format(Locale.US,"%.7f",lat));
-            fenceLonField.setText(String.format(Locale.US,"%.7f",lon));
+        btn("◎ 回到孩子最新位置",false,()->{
+            followChild=true;
+            if(map!=null && latest!=null){
+                String type=latest.optString("coordType","wgs84");
+                if("wgs84".equals(type)||"gcj02".equals(type)){
+                    double lat=latest.optDouble("lat",Double.NaN), lon=latest.optDouble("lon",Double.NaN);
+                    if(Double.isFinite(lat)&&Double.isFinite(lon)){
+                        map.animateCamera(CameraUpdateFactory.newLatLngZoom(toAmapPoint(lat,lon,type),17f));
+                        mapCentered=true;
+                    }
+                }
+            }
         });
-        btn("设置电子围栏",true,()->configureFence(true));
-        btn("关闭电子围栏",false,()->configureFence(false));
-        guardStatus=text("等待电子围栏和求助信息…",14,Color.rgb(40,64,90),false);add(guardStatus);
-        line("监护请求只会通知孩子确认，不会静默开启摄像头或麦克风。媒体默认在服务器保留最长 24 小时。") ;
-        btn("请求孩子拍照",false,()->askMedia("photo"));
-        btn("请求孩子录音",false,()->askMedia("audio"));
-        btn("请求孩子录像（最长 30 秒）",false,()->askMedia("video"));
-        mediaStatus=text("尚无媒体",14,Color.rgb(40,64,90),false);add(mediaStatus);
-        btn("查看最新照片 / 播放音频视频",false,this::downloadLatestMedia);
+        line("拖动或双指缩放地图后，会暂停自动居中；点击上方按钮继续跟随。");
+        parentStatus=text("正在同步孩子位置…",15,Color.rgb(33,62,96),false);add(parentStatus);
+        btn("查看定位技术详情",false,()->new AlertDialog.Builder(this)
+                .setTitle("定位数据与来源")
+                .setMessage(latestDiagnostics.isEmpty()?"还没有收到有效位置":latestDiagnostics)
+                .setPositiveButton("知道了",null).show());
+
+        cardTitle("快捷操作","实时地图是首页；更多操作在对应功能里完成。");
+        btn("查看历史轨迹",false,this::showHistoryPicker);
+        historyStatus=text("",13,Color.rgb(65,87,118),false);add(historyStatus);
+        btn("设置安全区域（地图选择）",true,this::openFenceEditor);
+        guardStatus=text("安全区域：正在加载…",14,Color.rgb(60,76,102),false);add(guardStatus);
+        btn("照片 · 录音 · 视频协助",false,this::showAssistancePicker);
+        mediaStatus=text("",13,Color.rgb(65,87,118),false);add(mediaStatus);
+        btn("查看孩子发来的照片或录音",false,this::downloadLatestMedia);
+
+        cardTitle("家庭管理","日常不需要这些操作。");
+        if(Build.VERSION.SDK_INT>=33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED){
+            btn("开启安全通知（SOS / 进出围栏）",false,()->requestPermissions(
+                    new String[]{Manifest.permission.POST_NOTIFICATIONS},401));
+        }
+        btn("生成新的孩子配对码",false,()->request(()->Api.call(this,"POST","/v1/pair",new JSONObject(),Prefs.token(this)),
+                result->saveDisplayedPairCode(result.optString("pairCode"))));
+        btn("检查 App 更新",false,()->UpdateManager.check(this,true));
+        btn("打开高德查看孩子位置",false,this::openMap);
         fetchLatest();loadGuard();loadMediaList();
+    }
+    private void showHistoryPicker(){
+        new AlertDialog.Builder(this).setTitle("查看历史轨迹")
+                .setItems(new String[]{"最近 1 小时","最近 6 小时","最近 24 小时"},
+                        (d,which)->loadHistory(new int[]{1,6,24}[which]))
+                .setNegativeButton("取消",null).show();
+    }
+    private void showAssistancePicker(){
+        new AlertDialog.Builder(this).setTitle("请求孩子协助")
+                .setMessage("孩子手机会收到请求，确认后才能使用相机或麦克风。")
+                .setItems(new String[]{"请孩子拍照","请孩子录音","请孩子录像（30 秒）"},
+                        (d,which)->askMedia(new String[]{"photo","audio","video"}[which]))
+                .setNegativeButton("取消",null).show();
+    }
+    private void openFenceEditor(){
+        if(!AmapPrivacy.available()){
+            show("当前 APK 未配置高德地图，请重新构建已配置 Key 的安装包");return;
+        }
+        if(!AmapPrivacy.agreed(this)){
+            askAmapConsent(this::openFenceEditor);return;
+        }
+        Intent i=new Intent(this,FenceMapActivity.class);
+        if(latest!=null){
+            double lat=latest.optDouble("lat",Double.NaN);
+            double lon=latest.optDouble("lon",Double.NaN);
+            if(Double.isFinite(lat)&&Double.isFinite(lon)&&Math.abs(lat)<=90&&Math.abs(lon)<=180){
+                i.putExtra("lat",lat);i.putExtra("lon",lon);
+                i.putExtra("coordType",latest.optString("coordType","wgs84"));
+            }
+        }
+        startActivity(i);
     }
     private void fetchLatest(){
         if(!"parent".equals(Prefs.role(this))||loading)return;
@@ -376,19 +470,16 @@ public class MainActivity extends Activity {
                             String freshness=ageOfFix<=10000?"实时（约 "+(ageOfFix/1000)+" 秒延迟）":ageOfFix<=30000?"延迟（约 "+(ageOfFix/1000)+" 秒）":"已过期（约 "+(ageOfFix/1000)+" 秒前），请勿视为实时";
                             double err=latest.optDouble("accuracy",9999);
                             String quality=err<=5?"优秀":err<=15?"良好":err<=50?"一般":"较差 / 室内可能漂移";
-                            String source="gps".equals(latest.optString("provider"))?"GNSS 卫星":
-                                    "amap".equals(latest.optString("provider"))?"高德融合定位":
-                                    "fused".equals(latest.optString("provider"))?"Android 系统融合":"网络备用 / 未知";
-                            String gnssDetail=latest.optInt("satellitesUsed",0)>0
-                                    ?"\n参与解算卫星："+latest.optInt("satellitesUsed")+" 颗，平均 C/N0："+
-                                    String.format(Locale.US,"%.1f",latest.optDouble("cn0DbHz",0))+" dB-Hz（仅作诊断）":"";
-                            parentStatus.setText("定位精度：约 ±"+String.format(Locale.CHINA,"%.1f",err)+" 米（"+quality+"）\n"
-                                    +"来源："+source+gnssDetail+"\n位置状态："+freshness+"\n"
-                                    +"最后更新："+time(latest.optLong("deviceTime"))+"\n"
-                                    +"经纬度："+String.format(Locale.US,"%.7f, %.7f",latest.optDouble("lat"),latest.optDouble("lon"))
-                                    +"\n连接："+state+"\n电量："+
-                                    (result.optInt("battery",-1)>=0?result.optInt("battery")+"%":"未知")
-                                    +"\n精度为系统估算的约 68% 置信半径，不是保证误差。");
+                            int battery=result.optInt("battery",-1);
+                            latestDiagnostics="时间："+time(latest.optLong("deviceTime"))+"\n来源："+
+                                    locationSourceLabel(latest.optString("provider",""))+"\n精度：±"+
+                                    String.format(Locale.CHINA,"%.1f",err)+" 米\n原始坐标："+
+                                    String.format(Locale.US,"%.7f, %.7f",latest.optDouble("lat"),latest.optDouble("lon"))+
+                                    "\n卫星参与解算："+latest.optInt("satellitesUsed",0)+" 颗";
+                            parentStatus.setText("位置："+freshness+"  ·  精度约 ±"+
+                                    String.format(Locale.CHINA,"%.0f",err)+" 米（"+quality+"）\n"+
+                                    "来源："+locationSourceLabel(latest.optString("provider",""))+"\n"+
+                                    "设备："+state+(battery>=0?"  ·  电量 "+battery+"%":""));
                         }
                     }
                     if(latest!=null){
@@ -447,47 +538,37 @@ public class MainActivity extends Activity {
         catch(Exception ex){show("无法打开地图："+ex.getMessage());}
     }
     private void child(){
-        title("孩子端 · 家庭位置共享");
-        line("服务器："+Prefs.get(this,"server"));
-        btn("修改服务器地址",false,this::editServer);
-        line("使用 Android GNSS（GPS/北斗等，依设备支持）、系统融合/网络定位备用；配置并授权高德 Android Key 后，同时启用高德融合定位。位置来源与精度以设备实际回报为准。");
-        childStatus=text("当前："+(Prefs.isSharing(this)?"已启动共享":"未共享位置"),16,Color.rgb(40,64,90),true);add(childStatus);
-        btn("开始持续共享位置",true,this::beginTracking);
-        if(AmapPrivacy.available()&&!AmapPrivacy.agreed(this)){
-            btn("可选：启用高德融合定位",false,()->askAmapConsent(()->{
-                if(Prefs.isSharing(this)){
-                    try{ContextCompatShim.start(this);}catch(RuntimeException ex){show("高德启用后服务刷新失败："+ex.getMessage());}
-                }
-                show("高德融合定位已授权，原生 GNSS 仍然保留");
-            }));
-        }
-        title("紧急求助 / 媒体确认");
-        btn("SOS · 一键发送求助（无需再次确认）",true,this::sendSOS);
-        btn("SOS + 自动启动可见录音（最长 30 秒）",true,()->{
-            // Pressing this visible button explicitly requests the microphone.
-            // The server never initiates it, and recording is not started from a background notification.
-            if(!sendSOS())return;
-            request(()->Api.call(this,"POST","/v1/media/self",
-                new JSONObject().put("kind","audio"),Prefs.token(this)),r->beginMedia(r.getString("id"),"audio"));
+        title("孩子端 · 安全守护");
+        childStatus=text(Prefs.isSharing(this)?"位置共享已开启（可随时停止）":"位置共享尚未开启",18,
+                Color.rgb(28,68,122),true);add(childStatus);
+        line("配对时已经确认持续共享。正常情况下无需重复启动；如果系统权限被关闭，可在这里重新开启。");
+        if(!Prefs.isSharing(this))btn("开启位置共享",true,this::beginTracking);
+        btn("SOS · 一键求助",true,this::sendSOS);
+        line("求助先保存到本机，再发送给家庭服务器。网络断开时将自动重试，但不能代替报警电话。");
+        btn("查看家长协助请求",false,this::fetchPendingMedia);
+        btn("主动发送照片 / 录音 / 视频",false,this::showSelfMediaPicker);
+        cardTitle("设备设置","系统可能限制后台运行，开启相应权限可以提高可靠性。");
+        btn("检查后台定位权限",false,()->{
+            Intent i=new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.parse("package:"+getPackageName()));
+            startActivity(i);
         });
-        line("首次使用时可授予必要权限；之后位置和电子围栏自动工作。录音与拍摄仍需打开孩子端确认，录像为最长 30 秒片段，并非后台隐蔽直播。") ;
-        btn("检查是否有来自家长的媒体请求",false,this::fetchPendingMedia);
-        title("主动发送安全信息");
-        line("以下操作由持机人主动启动，录音与录像过程可见，不会在锁屏后台静默使用摄像头或麦克风。");
-        btn("主动拍照并发送给家长",false,()->startSelfMedia("photo"));
-        btn("主动录音 30 秒并发送",false,()->startSelfMedia("audio"));
-        btn("主动录像 30 秒并发送",false,()->startSelfMedia("video"));
-        btn("立即停止共享位置",false,()->{
-            Prefs.setSharing(this,false);
-            startService(new Intent(this,TrackingService.class).setAction(TrackingService.STOP));
-            if(childStatus!=null)childStatus.setText("当前：已停止共享位置");show("已停止，未上传的缓存位置也会清除");
+        btn("检查 App 更新",false,()->UpdateManager.check(this,true));
+        if(Prefs.isSharing(this))btn("暂停位置共享",false,()->{
+            new AlertDialog.Builder(this).setTitle("暂停位置共享？")
+                    .setMessage("暂停后，家长只能看到最后一次位置，直到你重新开启。")
+                    .setNegativeButton("取消",null)
+                    .setPositiveButton("确认暂停",(d,w)->{
+                        Prefs.setSharing(this,false);
+                        startService(new Intent(this,TrackingService.class).setAction(TrackingService.STOP));
+                        render();
+                    }).show();
         });
-        btn("打开后台定位 / 始终允许权限设置",false,()->{
-            Intent i=new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.parse("package:"+getPackageName()));startActivity(i);
-        });
-        btn("检查系统定位开关",false,()->startActivity(new Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)));
-        line("重要：请在系统设置中选择“始终允许”位置权限，并允许自启动、关闭电池限制。Android 系统可能阻止部分后台恢复场景。");
-        line("服务器保存最新位置和最近 30 天轨迹；断网时最多缓存 1200 个加密定位点，恢复网络后补传。你可以随时停止共享。");
+    }
+    private void showSelfMediaPicker(){
+        new AlertDialog.Builder(this).setTitle("主动给家长发送")
+                .setItems(new String[]{"拍照","录音 30 秒","录像 30 秒"},
+                        (d,which)->startSelfMedia(new String[]{"photo","audio","video"}[which]))
+                .setNegativeButton("取消",null).show();
     }
     private boolean sendSOS(){
         if(!Prefs.isSharing(this)){show("请先开启位置守护，再使用 SOS 功能");return false;}
@@ -535,29 +616,19 @@ public class MainActivity extends Activity {
             else show("未授予精确定位权限，无法开始共享");
         }
     }
-    private void configureFence(boolean enabled){
-        try{
-            double lat=enabled?Double.parseDouble(fenceLatField.getText().toString().trim()):0;
-            double lon=enabled?Double.parseDouble(fenceLonField.getText().toString().trim()):0;
-            double radius=enabled?Double.parseDouble(fenceRadiusField.getText().toString().trim()):150;
-            if(enabled && (!Double.isFinite(lat)||!Double.isFinite(lon)||lat<-90||lat>90||lon<-180||lon>180||radius<80||radius>2000)){
-                show("请输入有效坐标，围栏半径 80–2000 米");return;
-            }
-            request(()->Api.call(this,"POST","/v1/fence",new JSONObject().put("enabled",enabled)
-                        .put("lat",lat).put("lon",lon).put("radius",radius),Prefs.token(this)),r->{show(enabled?"电子围栏已开启":"电子围栏已关闭");loadGuard();});
-        }catch(NumberFormatException ex){show("请输入数字经纬度和半径");}
-    }
     private void loadGuard(){
         if(!started||!"parent".equals(Prefs.role(this)))return;
         request(()->Api.call(this,"GET","/v1/guard",null,Prefs.token(this)),r->{
             JSONObject f=r.optJSONObject("fence");
             org.json.JSONArray events=r.optJSONArray("events");
-            StringBuilder b=new StringBuilder(f==null?"电子围栏：未开启":"电子围栏：已开启，半径 "+f.optInt("radius")+" 米");
+            StringBuilder b=new StringBuilder(f==null?"电子围栏：未开启":
+                    "polygon".equals(f.optString("shape"))?"电子围栏：自定义地图区域已开启":
+                            "电子围栏：已开启，半径 "+f.optInt("radius")+" 米");
             if(events!=null && events.length()>0){
                 JSONObject last=events.optJSONObject(events.length()-1);
                 if(last!=null){b.append("\n最新提醒：").append(last.optString("message")).append(" · ").append(time(last.optLong("time")));
                     String id=last.optString("id");
-                    if(!lastGuardEvent.isEmpty()&&!id.equals(lastGuardEvent))show("家庭提醒："+last.optString("message"));
+                    ParentAlertNotifier.handle(this,last);
                     lastGuardEvent=id;
                 }
             }

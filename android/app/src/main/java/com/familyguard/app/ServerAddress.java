@@ -7,6 +7,8 @@ import java.util.Locale;
 /** A private-network HTTP exception is allowed only for debug builds.
  * Tokens and family locations must never be sent to arbitrary cleartext hosts. */
 final class ServerAddress {
+    // Public endpoint only. Never embed FG_SETUP_TOKEN or recovery tokens here.
+    static final String DEFAULT_URL = "https://familyguard.lianmulan.top";
     private ServerAddress() {}
 
     static String normalize(String value, boolean debug) {

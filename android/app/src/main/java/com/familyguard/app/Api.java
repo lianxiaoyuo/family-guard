@@ -14,9 +14,7 @@ final class Api {
         boolean revoked(){return status==401||status==403;}
     }
     static JSONObject call(Context context, String method, String path, JSONObject payload, String token) throws Exception {
-        String base;
-        try {base=ServerAddress.normalize(Prefs.get(context,"server"),BuildConfig.DEBUG);}
-        catch (IllegalArgumentException ex){throw new IOException(ex.getMessage(),ex);}
+        String base=ServerAddress.DEFAULT_URL;
         URL url = new URL(base + path);
         HttpURLConnection conn = (HttpURLConnection)url.openConnection();
         // Live coordinate traffic must not occupy a network worker for 19 seconds.
@@ -59,7 +57,7 @@ final class Api {
     /** Authenticated media transport, max 25 MiB, no redirects or public media URLs. */
     static void upload(Context c,String id,String mime,File file) throws Exception {
         if(file.length()>25L*1024*1024 || file.length()<128)throw new IOException("媒体文件大小必须为 128B–25MB");
-        String base=ServerAddress.normalize(Prefs.get(c,"server"),BuildConfig.DEBUG);
+        String base=ServerAddress.DEFAULT_URL;
         HttpURLConnection conn=(HttpURLConnection)new URL(base+"/v1/media/upload?id="+id).openConnection();
         conn.setConnectTimeout(7000);conn.setReadTimeout(45000);conn.setRequestMethod("POST");
         conn.setRequestProperty("Authorization","Bearer "+Prefs.token(c));
@@ -73,7 +71,7 @@ final class Api {
         }finally{conn.disconnect();}
     }
     static void download(Context c,String id,File dest) throws Exception {
-        String base=ServerAddress.normalize(Prefs.get(c,"server"),BuildConfig.DEBUG);
+        String base=ServerAddress.DEFAULT_URL;
         HttpURLConnection conn=(HttpURLConnection)new URL(base+"/v1/media/file?id="+id).openConnection();
         conn.setConnectTimeout(7000);conn.setReadTimeout(45000);conn.setInstanceFollowRedirects(false);
         conn.setRequestProperty("Authorization","Bearer "+Prefs.token(c));

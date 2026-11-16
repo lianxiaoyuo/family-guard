@@ -15,10 +15,18 @@ import (
 
 // Additional safety features never activate a camera or microphone remotely.
 // A child must explicitly accept each request on their own visible device.
+// Legacy empty Shape means the original circle fence.
+// Polygon Points are WGS84 coordinates, not AMap GCJ-02 map coordinates.
 type Fence struct {
-	Lat    float64 `json:"lat"`
-	Lon    float64 `json:"lon"`
-	Radius float64 `json:"radius"`
+	Lat    float64       `json:"lat"`
+	Lon    float64       `json:"lon"`
+	Radius float64       `json:"radius"`
+	Shape  string        `json:"shape,omitempty"`
+	Points []FenceVertex `json:"points,omitempty"`
+}
+type FenceVertex struct {
+	Lat float64 `json:"lat"`
+	Lon float64 `json:"lon"`
 }
 type GuardEvent struct {
 	ID         string `json:"id"`
@@ -64,6 +72,12 @@ func (f *Family) addSOSEvent(id, message string, occurredAt int64) {
 	}
 }
 func validFence(v Fence) bool {
+	if v.Shape == "polygon" {
+		return validFencePolygon(v.Points)
+	}
+	if v.Shape != "" && v.Shape != "circle" {
+		return false
+	}
 	return !math.IsNaN(v.Lat) && !math.IsInf(v.Lat, 0) && !math.IsNaN(v.Lon) && !math.IsInf(v.Lon, 0) &&
 		v.Lat >= -90 && v.Lat <= 90 && v.Lon >= -180 && v.Lon <= 180 && v.Radius >= 80 && v.Radius <= 2000 && !math.IsNaN(v.Radius) && !math.IsInf(v.Radius, 0)
 }
@@ -89,14 +103,26 @@ func (f *Family) evaluateFence(p Point, now int64) {
 	if p.CoordType != "" && p.CoordType != "wgs84" && p.CoordType != "gcj02" {
 		return
 	}
-	dist := distanceMeters(lat, lon, f.Geofence.Lat, f.Geofence.Lon)
-	margin := math.Min(40, math.Max(15, f.Geofence.Radius*0.2))
 	candidate := ""
-	if dist <= f.Geofence.Radius-margin {
-		candidate = "inside"
-	}
-	if dist >= f.Geofence.Radius+margin {
-		candidate = "outside"
+	if f.Geofence.Shape == "polygon" {
+		inside, border := polygonPosition(lat, lon, f.Geofence.Points)
+		margin := math.Min(40, math.Max(15, p.Accuracy))
+		if border >= margin {
+			if inside {
+				candidate = "inside"
+			} else {
+				candidate = "outside"
+			}
+		}
+	} else {
+		dist := distanceMeters(lat, lon, f.Geofence.Lat, f.Geofence.Lon)
+		margin := math.Min(40, math.Max(15, f.Geofence.Radius*0.2))
+		if dist <= f.Geofence.Radius-margin {
+			candidate = "inside"
+		}
+		if dist >= f.Geofence.Radius+margin {
+			candidate = "outside"
+		}
 	}
 	if candidate == "" {
 		f.FenceCandidate = ""
@@ -181,16 +207,18 @@ func registerGuardRoutes(mux *http.ServeMux, a *App) {
 	})
 	mux.HandleFunc("POST /v1/fence", func(w http.ResponseWriter, r *http.Request) {
 		var v struct {
-			Enabled bool    `json:"enabled"`
-			Lat     float64 `json:"lat"`
-			Lon     float64 `json:"lon"`
-			Radius  float64 `json:"radius"`
+			Enabled bool          `json:"enabled"`
+			Lat     float64       `json:"lat"`
+			Lon     float64       `json:"lon"`
+			Radius  float64       `json:"radius"`
+			Shape   string        `json:"shape"`
+			Points  []FenceVertex `json:"points"`
 		}
 		if err := decode(r, &v); err != nil {
 			fail(w, 400, "bad fence body")
 			return
 		}
-		fence := Fence{Lat: v.Lat, Lon: v.Lon, Radius: v.Radius}
+		fence := Fence{Lat: v.Lat, Lon: v.Lon, Radius: v.Radius, Shape: v.Shape, Points: v.Points}
 		if v.Enabled && !validFence(fence) {
 			fail(w, 400, "invalid fence")
 			return
