@@ -70,9 +70,10 @@ final class Api {
             int status=conn.getResponseCode();if(status<200||status>=300)throw new IOException("媒体上传失败 HTTP "+status);
         }finally{conn.disconnect();}
     }
-    static void download(Context c,String id,File dest) throws Exception {
+    static void download(Context c,String id,File dest) throws Exception {download(c,id,dest,"");}
+    static void download(Context c,String id,File dest,String childId) throws Exception {
         String base=ServerAddress.DEFAULT_URL;
-        HttpURLConnection conn=(HttpURLConnection)new URL(base+"/v1/media/file?id="+id).openConnection();
+        HttpURLConnection conn=(HttpURLConnection)new URL(base+"/v1/media/file?id="+id+(childId==null||childId.isEmpty()?"":"&childId="+android.net.Uri.encode(childId))).openConnection();
         conn.setConnectTimeout(7000);conn.setReadTimeout(45000);conn.setInstanceFollowRedirects(false);
         conn.setRequestProperty("Authorization","Bearer "+Prefs.token(c));
         try {

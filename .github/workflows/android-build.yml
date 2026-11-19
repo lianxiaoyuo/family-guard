@@ -23,14 +23,18 @@ jobs:
       - name: Install Android API 35
         run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
       - name: Configure AMap Android Key (optional for CI)
+        id: configure_amap
         env:
           AMAP_KEY: ${{ secrets.AMAP_ANDROID_KEY }}
         run: |
           if [ -n "$AMAP_KEY" ]; then
             printf 'AMAP_KEY=%s\n' "$AMAP_KEY" > android/amap-key.properties
+            echo 'configured=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'configured=false' >> "$GITHUB_OUTPUT"
           fi
       - name: Verify AMap configuration when secret is provided
-        if: ${{ secrets.AMAP_ANDROID_KEY != '' }}
+        if: steps.configure_amap.outputs.configured == 'true'
         run: gradle --no-daemon -p android :app:verifyAmapConfiguration
       - name: Compile core algorithm tests
         working-directory: android
@@ -40,11 +44,19 @@ jobs:
           java -cp /tmp/familyguard-core-test com.familyguard.app.AccuracyPolicySelfTest
           java -cp /tmp/familyguard-core-test com.familyguard.app.CoordinateReferenceSelfTest
           java -cp /tmp/familyguard-core-test com.familyguard.app.ServerAddressSelfTest
+      - name: Test safety-event policy (pure Java)
+        working-directory: android
+        run: |
+          mkdir -p /tmp/familyguard-event-test
+          javac -encoding UTF-8 -d /tmp/familyguard-event-test \
+            app/src/main/java/com/familyguard/app/GuardEventPolicy.java \
+            tests/GuardEventPolicySelfTest.java
+          java -cp /tmp/familyguard-event-test com.familyguard.app.GuardEventPolicySelfTest
       - name: Compile debug APK
         working-directory: android
         run: gradle --no-daemon --stacktrace assembleDebug
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: FamilyGuard-v6-debug
+          name: FamilyGuard-v7.1-debug
           path: android/app/build/outputs/apk/debug/app-debug.apk

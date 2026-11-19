@@ -46,7 +46,10 @@ func newAlertConfigFromEnv() (*alertConfig, error) {
 	}
 	return &alertConfig{url: dest, bearer: os.Getenv("FG_ALERT_TOKEN"), client: &http.Client{Timeout: 5 * time.Second}}, nil
 }
-func shouldAlert(kind string) bool { return kind == "sos" || kind == "exit" || kind == "enter" }
+func shouldAlert(kind string) bool {
+	return kind == "sos" || kind == "exit" || kind == "enter" ||
+		kind == "offline" || kind == "low_battery" || kind == "location_stale"
+}
 func alertMessage(kind string) string {
 	switch kind {
 	case "sos":
@@ -55,6 +58,12 @@ func alertMessage(kind string) string {
 		return "Child device exited the configured safety area. Open FamilyGuard to verify the latest location."
 	case "enter":
 		return "Child device entered the configured safety area. Open FamilyGuard for details."
+	case "offline":
+		return "Child device has not connected for at least 5 minutes. Latest location may be stale."
+	case "low_battery":
+		return "Child device reported critically low battery. Open FamilyGuard to check its status."
+	case "location_stale":
+		return "Child phone is online but has not sent a fresh location for at least 10 minutes."
 	default:
 		return "A family safety event occurred."
 	}
@@ -74,7 +83,7 @@ func (c *alertConfig) publish(ctx context.Context, event GuardEvent) error {
 		return err
 	}
 	req.Header.Set("Title", "FamilyGuard safety alert")
-	if event.Kind == "sos" || event.Kind == "exit" {
+	if event.Kind == "sos" || event.Kind == "exit" || event.Kind == "offline" || event.Kind == "low_battery" || event.Kind == "location_stale" {
 		req.Header.Set("Priority", "5")
 	} else {
 		req.Header.Set("Priority", "4")

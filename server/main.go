@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,29 +41,47 @@ type Point struct {
 }
 
 type Family struct {
-	ID             string         `json:"id"`
-	ParentHash     string         `json:"parentHash"`
-	RecoveryHash   string         `json:"recoveryHash,omitempty"`
-	HistoryEpoch   int64          `json:"historyEpoch,omitempty"`
-	ChildHash      string         `json:"childHash,omitempty"`
-	ChildName      string         `json:"childName,omitempty"`
-	Latest         *Point         `json:"latest,omitempty"`
-	LastSeen       int64          `json:"lastSeen"`
-	Battery        int            `json:"battery"`
-	LastID         string         `json:"lastId,omitempty"`
-	RecentIDs      []string       `json:"recentIds,omitempty"`
-	Geofence       *Fence         `json:"geofence,omitempty"`
-	FenceKnown     bool           `json:"fenceKnown,omitempty"`
-	FenceInside    bool           `json:"fenceInside,omitempty"`
-	FenceCandidate string         `json:"fenceCandidate,omitempty"`
-	FenceCount     int            `json:"fenceCount,omitempty"`
-	GuardEvents    []GuardEvent   `json:"guardEvents,omitempty"`
-	AlertAck       []string       `json:"alertAck,omitempty"`
-	Media          []MediaRequest `json:"media,omitempty"`
+	ID                   string         `json:"id"`
+	ParentID             string         `json:"parentId,omitempty"` // additional child device; never an independent family
+	FamilyName           string         `json:"familyName,omitempty"`
+	EmailHash            string         `json:"emailHash,omitempty"`
+	Members              []FamilyMember `json:"members,omitempty"`
+	ParentHash           string         `json:"parentHash"`
+	RecoveryHash         string         `json:"recoveryHash,omitempty"`
+	HistoryEpoch         int64          `json:"historyEpoch,omitempty"`
+	ChildHash            string         `json:"childHash,omitempty"`
+	ChildName            string         `json:"childName,omitempty"`
+	Latest               *Point         `json:"latest,omitempty"`
+	LastSeen             int64          `json:"lastSeen"`
+	Battery              int            `json:"battery"`
+	OfflineAlerted       bool           `json:"offlineAlerted,omitempty"`
+	LowBatteryAlerted    bool           `json:"lowBatteryAlerted,omitempty"`
+	LocationStaleAlerted bool           `json:"locationStaleAlerted,omitempty"`
+	LocationWaitSince    int64          `json:"locationWaitSince,omitempty"` // First online heartbeat before any valid location
+	LastID               string         `json:"lastId,omitempty"`
+	RecentIDs            []string       `json:"recentIds,omitempty"`
+	Geofence             *Fence         `json:"geofence,omitempty"`
+	FenceKnown           bool           `json:"fenceKnown,omitempty"`
+	FenceInside          bool           `json:"fenceInside,omitempty"`
+	FenceCandidate       string         `json:"fenceCandidate,omitempty"`
+	FenceCount           int            `json:"fenceCount,omitempty"`
+	GuardEvents          []GuardEvent   `json:"guardEvents,omitempty"`
+	AlertAck             []string       `json:"alertAck,omitempty"`
+	Media                []MediaRequest `json:"media,omitempty"`
+}
+
+type FamilyMember struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	TokenHash string `json:"tokenHash"`
 }
 
 type Registry struct {
 	Families map[string]*Family `json:"families"`
+}
+type Invitation struct {
+	FamilyID string
+	Expiry   time.Time
 }
 type Pair struct {
 	FamilyID string
@@ -73,22 +92,31 @@ type Limit struct {
 	Expires time.Time
 }
 type App struct {
-	mu           sync.RWMutex
-	dir          string
-	reg          Registry
-	pairs        map[string]Pair
-	attempts     map[string]Limit
-	parentIndex  map[string]*Family
-	childIndex   map[string]*Family
-	lastPurge    time.Time
-	mediaUploads map[string]bool // guarded by mu; never hold global lock during network upload
+	mu              sync.RWMutex
+	dir             string
+	reg             Registry
+	pairs           map[string]Pair
+	familyInvites   map[string]Invitation
+	memberInvites   map[string]Invitation
+	emailChallenges map[string]emailChallenge
+	emailIndex      map[string]*Family
+	emailSender     func(string, string) error
+	emailQuotaStart time.Time
+	emailQuotaCount int
+	attempts        map[string]Limit
+	anonSignups     map[string]Limit
+	anonGlobal      Limit
+	parentIndex     map[string]*Family
+	childIndex      map[string]*Family
+	lastPurge       time.Time
+	mediaUploads    map[string]bool // guarded by mu; never hold global lock during network upload
 }
 
 func newApp(dir string) (*App, error) {
 	if err := os.MkdirAll(filepath.Join(dir, "families"), 0700); err != nil {
 		return nil, err
 	}
-	a := &App{dir: dir, reg: Registry{Families: map[string]*Family{}}, pairs: map[string]Pair{}, attempts: map[string]Limit{}, parentIndex: map[string]*Family{}, childIndex: map[string]*Family{}, mediaUploads: map[string]bool{}}
+	a := &App{dir: dir, reg: Registry{Families: map[string]*Family{}}, pairs: map[string]Pair{}, familyInvites: map[string]Invitation{}, memberInvites: map[string]Invitation{}, emailChallenges: map[string]emailChallenge{}, emailIndex: map[string]*Family{}, emailSender: sendEmailCode, attempts: map[string]Limit{}, anonSignups: map[string]Limit{}, parentIndex: map[string]*Family{}, childIndex: map[string]*Family{}, mediaUploads: map[string]bool{}}
 	// One-time, idempotent migration from V1's families.json.
 	legacy := filepath.Join(dir, "families.json")
 	if b, err := os.ReadFile(legacy); err == nil {
@@ -131,13 +159,41 @@ func newApp(dir string) (*App, error) {
 		if err := json.Unmarshal(b, &f); err != nil {
 			return nil, fmt.Errorf("family %s: %w", e.Name(), err)
 		}
-		if f.ID == "" || f.ID+".json" != e.Name() || f.ParentHash == "" {
+		if f.ID == "" || f.ID+".json" != e.Name() || (f.ParentID == "" && f.ParentHash == "") || (f.ParentID != "" && (f.ParentHash != "" || f.ChildHash == "")) {
 			return nil, fmt.Errorf("invalid family: %s", e.Name())
 		}
 		a.reg.Families[f.ID] = &f
-		a.parentIndex[f.ParentHash] = &f
+	}
+	// Rebuild indexes only after every record is loaded. Reject broken cross-family links.
+	for _, f := range a.reg.Families {
+		if f.ParentID != "" {
+			owner := a.reg.Families[f.ParentID]
+			if owner == nil || owner.ParentID != "" || f.ParentID == f.ID {
+				return nil, fmt.Errorf("orphan child device: %s", f.ID)
+			}
+		} else {
+			if f.EmailHash != "" {
+				if len(f.EmailHash) != 64 || a.emailIndex[f.EmailHash] != nil {
+					return nil, errors.New("invalid duplicate family email identity")
+				}
+				a.emailIndex[f.EmailHash] = f
+			}
+			if a.parentIndex[f.ParentHash] != nil {
+				return nil, errors.New("duplicate family owner token")
+			}
+			a.parentIndex[f.ParentHash] = f
+			for _, member := range f.Members {
+				if len(member.TokenHash) != 64 || a.parentIndex[member.TokenHash] != nil {
+					return nil, errors.New("invalid duplicate member token")
+				}
+				a.parentIndex[member.TokenHash] = f
+			}
+		}
 		if f.ChildHash != "" {
-			a.childIndex[f.ChildHash] = &f
+			if a.childIndex[f.ChildHash] != nil {
+				return nil, errors.New("duplicate child token")
+			}
+			a.childIndex[f.ChildHash] = f
 		}
 	}
 	a.purgeLocked()
@@ -202,6 +258,7 @@ func historyKey(f *Family) string {
 }
 func cloneFamily(f *Family) Family {
 	old := *f
+	old.Members = append([]FamilyMember(nil), f.Members...)
 	old.RecentIDs = append([]string(nil), f.RecentIDs...)
 	old.GuardEvents = append([]GuardEvent(nil), f.GuardEvents...)
 	old.AlertAck = append([]string(nil), f.AlertAck...)
@@ -313,14 +370,74 @@ func (a *App) auth(r *http.Request, role string) *Family {
 	}
 	return nil
 }
+
+// rootCountLocked excludes extra child records, so an existing family may add children
+// without changing the single-family registration protection.
+func (a *App) rootCountLocked() int {
+	n := 0
+	for _, f := range a.reg.Families {
+		if f.ParentID == "" {
+			n++
+		}
+	}
+	return n
+}
+func (a *App) childrenLocked(root *Family) []*Family {
+	out := make([]*Family, 0, 8)
+	if root.ChildHash != "" {
+		out = append(out, root)
+	}
+	for _, f := range a.reg.Families {
+		if f.ParentID == root.ID && f.ChildHash != "" {
+			out = append(out, f)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].ChildName < out[j].ChildName || (out[i].ChildName == out[j].ChildName && out[i].ID < out[j].ID)
+	})
+	return out
+}
+
+// selectChildLocked never accepts an id belonging to a different family.
+// Empty childId maintains V7.2 API compatibility for the original child.
+func (a *App) selectChildLocked(root *Family, id string) *Family {
+	if root == nil || root.ParentID != "" {
+		return nil
+	}
+	if id == "" || id == root.ID {
+		return root
+	}
+	child := a.reg.Families[id]
+	if child == nil || child.ParentID != root.ID {
+		return nil
+	}
+	return child
+}
+func isOwner(r *http.Request, f *Family) bool {
+	return f != nil && hash(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")) == f.ParentHash
+}
+func validName(n string) bool { return n != "" && len([]rune(n)) <= 32 }
+
 func requestIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
 	ip := net.ParseIP(host)
-	// Trust X-Real-IP ONLY from loopback Nginx, which overwrites the inbound header.
-	if ip != nil && ip.IsLoopback() {
+	// Trust X-Real-IP only from a designated reverse proxy that overwrites it.
+	// Docker bridge IPs are never trusted by default; configure exact IPs with
+	// FG_TRUSTED_PROXY_IPS, e.g. 172.18.0.1, after confirming Nginx wiring.
+	trusted := ip != nil && ip.IsLoopback()
+	if ip != nil && !trusted {
+		for _, allowed := range strings.Split(os.Getenv("FG_TRUSTED_PROXY_IPS"), ",") {
+			parsed := net.ParseIP(strings.TrimSpace(allowed))
+			if parsed != nil && parsed.Equal(ip) {
+				trusted = true
+				break
+			}
+		}
+	}
+	if trusted {
 		real := strings.TrimSpace(r.Header.Get("X-Real-IP"))
 		if parsed := net.ParseIP(real); parsed != nil {
 			return parsed.String()
@@ -348,6 +465,49 @@ func (a *App) rateLimitLocked(r *http.Request) bool {
 	}
 	return v.Count > 12
 }
+
+func anonymousModeReady(a *App) bool {
+	return os.Getenv("FG_REGISTRATION_MODE") == "anonymous" && os.Getenv("FG_SINGLE_FAMILY") != "1" &&
+		strings.TrimSpace(os.Getenv("FG_ALERT_URL")) == "" &&
+		len(strings.TrimSpace(os.Getenv("FG_PLATFORM_ADMIN_TOKEN"))) >= 32 &&
+		a.rootCountLocked() < maxAnonymousFamilies()
+}
+
+// Anonymous signups have no identity verification. Limits cap public disk abuse;
+// the reverse proxy still needs its own rate limits and anomaly monitoring.
+// Keep a hard family count cap even if the process restarts.
+func maxAnonymousFamilies() int {
+	n, err := strconv.Atoi(strings.TrimSpace(os.Getenv("FG_MAX_FAMILIES")))
+	if err != nil || n < 1 || n > 100000 {
+		return 1000
+	}
+	return n
+}
+func (a *App) anonymousSignupLimitedLocked(r *http.Request, commit bool) bool {
+	now := time.Now()
+	ip := requestIP(r)
+	perIP := a.anonSignups[ip]
+	if now.After(perIP.Expires) {
+		perIP = Limit{Expires: now.Add(24 * time.Hour)}
+	}
+	global := a.anonGlobal
+	if now.After(global.Expires) {
+		global = Limit{Expires: now.Add(24 * time.Hour)}
+	}
+	if !commit {
+		return perIP.Count >= 3 || global.Count >= 60
+	}
+	perIP.Count++
+	global.Count++
+	a.anonSignups[ip] = perIP
+	a.anonGlobal = global
+	for k, item := range a.anonSignups {
+		if now.After(item.Expires) {
+			delete(a.anonSignups, k)
+		}
+	}
+	return false
+}
 func (a *App) newPairLocked(id string) string {
 	for k, v := range a.pairs {
 		if time.Now().After(v.Expiry) || v.FamilyID == id {
@@ -366,44 +526,236 @@ func (a *App) newPairLocked(id string) string {
 func (a *App) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { write(w, 200, map[string]string{"status": "ok"}) })
+	mux.HandleFunc("GET /v1/registration/status", func(w http.ResponseWriter, r *http.Request) {
+		a.mu.RLock()
+		defer a.mu.RUnlock()
+		write(w, 200, map[string]any{"available": anonymousModeReady(a), "method": "anonymous"})
+	})
 	mux.HandleFunc("POST /v1/families", func(w http.ResponseWriter, r *http.Request) {
-		token := randomHex(32)
-		recovery := randomHex(32)
-		id := randomHex(12)
+		var body struct {
+			InviteCode string `json:"inviteCode"`
+			Name       string `json:"name"`
+		}
+		if err := decode(r, &body); err != nil {
+			fail(w, 400, "invalid family registration")
+			return
+		}
 		a.mu.Lock()
 		defer a.mu.Unlock()
-		if os.Getenv("FG_SINGLE_FAMILY") == "1" && len(a.reg.Families) > 0 {
-			fail(w, 409, "this private server already has a paired family; use recovery key")
-			return
-		}
 		if a.rateLimitLocked(r) {
-			fail(w, 429, "too many family creations")
+			fail(w, 429, "too many attempts")
 			return
 		}
-		if os.Getenv("FG_SINGLE_FAMILY") == "1" {
+		roots := a.rootCountLocked()
+		mode := os.Getenv("FG_REGISTRATION_MODE")
+		// Email-verified family creation can only happen through verified OTP.
+		if mode == "email" {
+			fail(w, 403, "email verification required; use /v1/auth/email/request")
+			return
+		}
+		if os.Getenv("FG_SINGLE_FAMILY") == "1" && roots > 0 {
+			fail(w, 409, "this private server already has a family; invite registration is disabled")
+			return
+		}
+		invitationMode := mode == "invite"
+		anonymousMode := mode == "anonymous"
+		if anonymousMode {
+			if os.Getenv("FG_SINGLE_FAMILY") == "1" || strings.TrimSpace(os.Getenv("FG_ALERT_URL")) != "" ||
+				len(strings.TrimSpace(os.Getenv("FG_PLATFORM_ADMIN_TOKEN"))) < 32 {
+				fail(w, 503, "independent family creation is not configured")
+				return
+			}
+			if roots >= maxAnonymousFamilies() {
+				fail(w, 503, "new family capacity reached")
+				return
+			}
+			if a.anonymousSignupLimitedLocked(r, false) {
+				fail(w, 429, "family creation limit reached; try again later")
+				return
+			}
+		}
+		// A single-topic push relay cannot isolate several unrelated families.
+		if roots > 0 && strings.TrimSpace(os.Getenv("FG_ALERT_URL")) != "" {
+			fail(w, 503, "shared emergency relay must be replaced before multi-family registration")
+			return
+		}
+		if roots > 0 && invitationMode {
+			code := strings.ToUpper(strings.TrimSpace(body.InviteCode))
+			invite, ok := a.familyInvites[hash(code)]
+			if !ok || time.Now().After(invite.Expiry) {
+				fail(w, 403, "invalid or expired family invitation")
+				return
+			}
+			// One-time invitation is removed only after the family was safely persisted.
+		} else if os.Getenv("FG_SINGLE_FAMILY") == "1" || invitationMode {
 			setupToken := strings.TrimSpace(os.Getenv("FG_SETUP_TOKEN"))
+			provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 			if len(setupToken) < 32 {
 				fail(w, 503, "family registration not configured")
 				return
 			}
-			provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") ||
-				len(provided) != len(setupToken) ||
-				subtle.ConstantTimeCompare([]byte(provided), []byte(setupToken)) != 1 {
+			if roots > 0 || len(provided) != len(setupToken) || subtle.ConstantTimeCompare([]byte(provided), []byte(setupToken)) != 1 {
 				fail(w, 401, "invalid initial setup key")
 				return
 			}
 		}
-		f := &Family{ID: id, ParentHash: hash(token), RecoveryHash: hash(recovery), Battery: -1}
-		a.reg.Families[id] = f
+		name := strings.TrimSpace(body.Name)
+		if name == "" {
+			name = "我的家庭"
+		}
+		if !validName(name) {
+			fail(w, 400, "invalid family name")
+			return
+		}
+		token, recovery, id := randomHex(32), randomHex(32), randomHex(12)
+		f := &Family{ID: id, ParentHash: hash(token), RecoveryHash: hash(recovery), FamilyName: name, Battery: -1}
 		if err := a.saveFamilyLocked(f); err != nil {
-			delete(a.reg.Families, id)
 			fail(w, 500, "storage error")
 			return
 		}
+		a.reg.Families[id] = f
 		a.parentIndex[f.ParentHash] = f
+		if roots > 0 && invitationMode {
+			delete(a.familyInvites, hash(strings.ToUpper(strings.TrimSpace(body.InviteCode))))
+		}
+		if anonymousMode {
+			a.anonymousSignupLimitedLocked(r, true) // account only after successful fsync
+		}
 		code := a.newPairLocked(id)
-		write(w, 201, map[string]any{"token": token, "recoveryKey": recovery, "pairCode": code, "expiresInSeconds": 600})
+		write(w, 201, map[string]any{"token": token, "recoveryKey": recovery, "pairCode": code, "expiresInSeconds": 600, "familyId": id})
+	})
+	// Only the explicitly configured owner family can issue invitations to other
+	// families. Other parents cannot invite strangers or enumerate all families.
+	mux.HandleFunc("POST /v1/families/invite", func(w http.ResponseWriter, r *http.Request) {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		f := a.auth(r, "parent")
+		if f == nil {
+			fail(w, 401, "unauthorized")
+			return
+		}
+		if os.Getenv("FG_REGISTRATION_MODE") != "invite" || os.Getenv("FG_SINGLE_FAMILY") == "1" ||
+			strings.TrimSpace(os.Getenv("FG_ALERT_URL")) != "" ||
+			os.Getenv("FG_INVITE_OWNER_FAMILY_ID") != f.ID || !isOwner(r, f) {
+			fail(w, 403, "family invitations are not enabled for this account")
+			return
+		}
+		if len(a.familyInvites) >= 100 {
+			fail(w, 429, "too many outstanding invitations")
+			return
+		}
+		code := strings.ToUpper(randomHex(16))
+		a.familyInvites[hash(code)] = Invitation{FamilyID: f.ID, Expiry: time.Now().Add(24 * time.Hour)}
+		write(w, 201, map[string]any{"inviteCode": code, "expiresInSeconds": 86400})
+	})
+	mux.HandleFunc("POST /v1/members/invite", func(w http.ResponseWriter, r *http.Request) {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		f := a.auth(r, "parent")
+		if f == nil {
+			fail(w, 401, "unauthorized")
+			return
+		}
+		if !isOwner(r, f) {
+			fail(w, 403, "only family owner can invite guardians")
+			return
+		}
+		if len(f.Members) >= 6 || len(a.memberInvites) >= 100 {
+			fail(w, 409, "guardian limit reached")
+			return
+		}
+		code := strings.ToUpper(randomHex(12))
+		a.memberInvites[hash(code)] = Invitation{FamilyID: f.ID, Expiry: time.Now().Add(10 * time.Minute)}
+		write(w, 201, map[string]any{"inviteCode": code, "expiresInSeconds": 600})
+	})
+	mux.HandleFunc("POST /v1/members/join", func(w http.ResponseWriter, r *http.Request) {
+		var v struct {
+			Code string `json:"code"`
+			Name string `json:"name"`
+		}
+		if err := decode(r, &v); err != nil {
+			fail(w, 400, "invalid request")
+			return
+		}
+		v.Name = strings.TrimSpace(v.Name)
+		if !validName(v.Name) {
+			fail(w, 400, "invalid guardian name")
+			return
+		}
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if a.rateLimitLocked(r) {
+			fail(w, 429, "too many attempts")
+			return
+		}
+		code := hash(strings.ToUpper(strings.TrimSpace(v.Code)))
+		inv, ok := a.memberInvites[code]
+		f := a.reg.Families[inv.FamilyID]
+		if !ok || time.Now().After(inv.Expiry) || f == nil || f.ParentID != "" || len(f.Members) >= 6 {
+			fail(w, 403, "invalid or expired invitation")
+			return
+		}
+		token := randomHex(32)
+		m := FamilyMember{ID: randomHex(8), Name: v.Name, TokenHash: hash(token)}
+		if err := a.withSavedFamily(f, func() { f.Members = append(f.Members, m) }); err != nil {
+			fail(w, 500, "storage error")
+			return
+		}
+		delete(a.memberInvites, code)
+		a.parentIndex[m.TokenHash] = f
+		write(w, 200, map[string]any{"token": token, "familyId": f.ID, "familyName": f.FamilyName})
+	})
+	mux.HandleFunc("GET /v1/members", func(w http.ResponseWriter, r *http.Request) {
+		a.mu.RLock()
+		defer a.mu.RUnlock()
+		f := a.auth(r, "parent")
+		if f == nil {
+			fail(w, 401, "unauthorized")
+			return
+		}
+		entries := make([]map[string]string, 0, len(f.Members))
+		for _, m := range f.Members {
+			entries = append(entries, map[string]string{"id": m.ID, "name": m.Name})
+		}
+		write(w, 200, map[string]any{"members": entries, "owner": isOwner(r, f), "familyName": f.FamilyName})
+	})
+	mux.HandleFunc("POST /v1/members/revoke", func(w http.ResponseWriter, r *http.Request) {
+		var v struct {
+			ID string `json:"id"`
+		}
+		if err := decode(r, &v); err != nil {
+			fail(w, 400, "invalid request")
+			return
+		}
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		f := a.auth(r, "parent")
+		if f == nil {
+			fail(w, 401, "unauthorized")
+			return
+		}
+		if !isOwner(r, f) {
+			fail(w, 403, "only owner can remove guardians")
+			return
+		}
+		idx := -1
+		for i, m := range f.Members {
+			if m.ID == v.ID {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			fail(w, 404, "member not found")
+			return
+		}
+		oldHash := f.Members[idx].TokenHash
+		if err := a.withSavedFamily(f, func() { f.Members = append(f.Members[:idx:idx], f.Members[idx+1:]...) }); err != nil {
+			fail(w, 500, "storage error")
+			return
+		}
+		delete(a.parentIndex, oldHash)
+		write(w, 200, map[string]bool{"ok": true})
 	})
 	mux.HandleFunc("POST /v1/recovery-key", func(w http.ResponseWriter, r *http.Request) {
 		a.mu.Lock()
@@ -411,6 +763,10 @@ func (a *App) handler() http.Handler {
 		f := a.auth(r, "parent")
 		if f == nil {
 			fail(w, 401, "unauthorized")
+			return
+		}
+		if !isOwner(r, f) {
+			fail(w, 403, "only family owner can replace recovery key")
 			return
 		}
 		key := randomHex(32)
@@ -461,33 +817,48 @@ func (a *App) handler() http.Handler {
 		a.parentIndex[f.ParentHash] = f
 		write(w, 200, map[string]any{"token": newToken, "recoveryKey": newRecovery})
 	})
-	mux.HandleFunc("POST /v1/pair", func(w http.ResponseWriter, r *http.Request) {
-		a.mu.Lock()
-		defer a.mu.Unlock()
-		f := a.auth(r, "parent")
-		if f == nil {
+	mux.HandleFunc("GET /v1/children", func(w http.ResponseWriter, r *http.Request) {
+		a.mu.RLock()
+		defer a.mu.RUnlock()
+		root := a.auth(r, "parent")
+		if root == nil {
 			fail(w, 401, "unauthorized")
 			return
 		}
-		if f.ChildHash != "" {
-			fail(w, 409, "a child is already paired")
+		children := make([]map[string]any, 0)
+		for _, f := range a.childrenLocked(root) {
+			children = append(children, map[string]any{"childId": f.ID, "childName": f.ChildName, "point": f.Latest,
+				"lastSeen": f.LastSeen, "battery": f.Battery})
+		}
+		write(w, 200, map[string]any{"familyId": root.ID, "familyName": root.FamilyName, "children": children, "serverTime": time.Now().UnixMilli()})
+	})
+	mux.HandleFunc("POST /v1/pair", func(w http.ResponseWriter, r *http.Request) {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		root := a.auth(r, "parent")
+		if root == nil {
+			fail(w, 401, "unauthorized")
 			return
 		}
-		code := a.newPairLocked(f.ID)
+		if len(a.childrenLocked(root)) >= 8 {
+			fail(w, 409, "maximum 8 child devices per family")
+			return
+		}
+		code := a.newPairLocked(root.ID)
 		write(w, 200, map[string]any{"pairCode": code, "expiresInSeconds": 600})
 	})
 	mux.HandleFunc("POST /v1/join", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
+		var v struct {
 			Code string `json:"code"`
 			Name string `json:"name"`
 		}
-		if err := decode(r, &body); err != nil {
+		if err := decode(r, &v); err != nil {
 			fail(w, 400, err.Error())
 			return
 		}
-		code := strings.ToUpper(strings.TrimSpace(body.Code))
-		body.Name = strings.TrimSpace(body.Name)
-		if len(body.Name) == 0 || len([]rune(body.Name)) > 32 {
+		code := strings.ToUpper(strings.TrimSpace(v.Code))
+		v.Name = strings.TrimSpace(v.Name)
+		if !validName(v.Name) {
 			fail(w, 400, "invalid child name")
 			return
 		}
@@ -502,19 +873,31 @@ func (a *App) handler() http.Handler {
 			fail(w, 400, "invalid or expired pairing code")
 			return
 		}
-		f := a.reg.Families[pair.FamilyID]
-		if f == nil || f.ChildHash != "" {
-			fail(w, 409, "already paired")
+		root := a.reg.Families[pair.FamilyID]
+		if root == nil || root.ParentID != "" || len(a.childrenLocked(root)) >= 8 {
+			fail(w, 409, "family child limit reached")
 			return
 		}
 		token := randomHex(32)
-		if err := a.withSavedFamily(f, func() { f.ChildHash = hash(token); f.ChildName = body.Name }); err != nil {
+		if root.ChildHash == "" {
+			if err := a.withSavedFamily(root, func() { root.ChildHash = hash(token); root.ChildName = v.Name }); err != nil {
+				fail(w, 500, "storage error")
+				return
+			}
+			a.childIndex[root.ChildHash] = root
+			delete(a.pairs, code)
+			write(w, 200, map[string]any{"token": token, "childName": v.Name, "childId": root.ID})
+			return
+		}
+		child := &Family{ID: randomHex(12), ParentID: root.ID, ChildHash: hash(token), ChildName: v.Name, Battery: -1}
+		if err := a.saveFamilyLocked(child); err != nil {
 			fail(w, 500, "storage error")
 			return
 		}
+		a.reg.Families[child.ID] = child
+		a.childIndex[child.ChildHash] = child
 		delete(a.pairs, code)
-		a.childIndex[f.ChildHash] = f
-		write(w, 200, map[string]string{"token": token, "childName": f.ChildName})
+		write(w, 200, map[string]any{"token": token, "childName": v.Name, "childId": child.ID})
 	})
 	mux.HandleFunc("POST /v1/points", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
@@ -591,6 +974,7 @@ func (a *App) handler() http.Handler {
 		}
 		f.LastSeen = now
 		f.Battery = body.Battery
+		f.noteTelemetryLocked(body.Battery)
 		if err := a.saveFamilyLocked(f); err != nil {
 			*f = old
 			if rollback != nil {
@@ -643,6 +1027,7 @@ func (a *App) handler() http.Handler {
 			}
 			f.LastSeen = now
 			f.Battery = body.Battery
+			f.noteTelemetryLocked(body.Battery)
 		}); err != nil {
 			fail(w, 500, "storage error")
 			return
@@ -664,7 +1049,7 @@ func (a *App) handler() http.Handler {
 			fail(w, 401, "unauthorized")
 			return
 		}
-		if err := a.withSavedFamily(f, func() { f.LastSeen = time.Now().UnixMilli(); f.Battery = b.Battery }); err != nil {
+		if err := a.withSavedFamily(f, func() { f.LastSeen = time.Now().UnixMilli(); f.Battery = b.Battery; f.noteTelemetryLocked(b.Battery) }); err != nil {
 			fail(w, 500, "storage error")
 			return
 		}
@@ -673,19 +1058,30 @@ func (a *App) handler() http.Handler {
 	mux.HandleFunc("GET /v1/latest", func(w http.ResponseWriter, r *http.Request) {
 		a.mu.RLock()
 		defer a.mu.RUnlock()
-		f := a.auth(r, "parent")
-		if f == nil {
+		root := a.auth(r, "parent")
+		if root == nil {
 			fail(w, 401, "unauthorized")
 			return
 		}
-		write(w, 200, map[string]any{"childName": f.ChildName, "paired": f.ChildHash != "", "point": f.Latest, "lastSeen": f.LastSeen, "battery": f.Battery, "serverTime": time.Now().UnixMilli()})
+		f := a.selectChildLocked(root, r.URL.Query().Get("childId"))
+		if f == nil {
+			fail(w, 404, "child not in family")
+			return
+		}
+		write(w, 200, map[string]any{"childId": f.ID, "childName": f.ChildName, "paired": f.ChildHash != "", "point": f.Latest, "lastSeen": f.LastSeen, "battery": f.Battery, "serverTime": time.Now().UnixMilli()})
 	})
 	mux.HandleFunc("GET /v1/history", func(w http.ResponseWriter, r *http.Request) {
 		a.mu.RLock()
-		f := a.auth(r, "parent")
-		if f == nil {
+		root := a.auth(r, "parent")
+		if root == nil {
 			a.mu.RUnlock()
 			fail(w, 401, "unauthorized")
+			return
+		}
+		f := a.selectChildLocked(root, r.URL.Query().Get("childId"))
+		if f == nil {
+			a.mu.RUnlock()
+			fail(w, 404, "child not in family")
 			return
 		}
 		id := historyKey(f)
@@ -709,9 +1105,28 @@ func (a *App) handler() http.Handler {
 	mux.HandleFunc("POST /v1/unpair", func(w http.ResponseWriter, r *http.Request) {
 		a.mu.Lock()
 		defer a.mu.Unlock()
-		f := a.auth(r, "parent")
-		if f == nil {
+		root := a.auth(r, "parent")
+		if root == nil {
 			fail(w, 401, "unauthorized")
+			return
+		}
+		f := a.selectChildLocked(root, r.URL.Query().Get("childId"))
+		if f == nil {
+			fail(w, 404, "child not in family")
+			return
+		}
+		if f.ParentID != "" {
+			// Revoke token before deleting history and media; client cannot regain access.
+			delete(a.childIndex, f.ChildHash)
+			if err := os.Remove(filepath.Join(a.dir, "families", f.ID+".json")); err != nil {
+				a.childIndex[f.ChildHash] = f
+				fail(w, 500, "storage error")
+				return
+			}
+			delete(a.reg.Families, f.ID)
+			_ = os.RemoveAll(filepath.Join(a.dir, "media", f.ID))
+			_ = os.RemoveAll(filepath.Join(a.dir, "history", historyKey(f)))
+			write(w, 200, map[string]bool{"ok": true})
 			return
 		}
 		oldChild := f.ChildHash
@@ -729,6 +1144,10 @@ func (a *App) handler() http.Handler {
 			f.RecentIDs = nil
 			f.LastSeen = 0
 			f.Battery = -1
+			f.OfflineAlerted = false
+			f.LowBatteryAlerted = false
+			f.LocationStaleAlerted = false
+			f.LocationWaitSince = 0
 			f.HistoryEpoch++
 		}); err != nil {
 			fail(w, 500, "storage error")
@@ -744,6 +1163,8 @@ func (a *App) handler() http.Handler {
 		write(w, 200, map[string]bool{"ok": true})
 	})
 	registerGuardRoutes(mux, a)
+	registerEmailAuthRoutes(mux, a)
+	registerPlatformAdminRoutes(mux, a)
 	registerAppUpdateRoutes(mux, a.dir)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Frame-Options", "DENY")
@@ -904,21 +1325,55 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if os.Getenv("FG_SINGLE_FAMILY") == "1" && len(app.reg.Families) == 0 &&
+	if os.Getenv("FG_SINGLE_FAMILY") == "1" && app.rootCountLocked() == 0 &&
 		len(strings.TrimSpace(os.Getenv("FG_SETUP_TOKEN"))) < 32 {
 		log.Fatal("initial single-family setup requires FG_SETUP_TOKEN of at least 32 characters")
+	}
+	// Production cannot accidentally expose a public unauthenticated signup endpoint.
+	if os.Getenv("FG_SINGLE_FAMILY") != "1" && os.Getenv("FG_REGISTRATION_MODE") != "invite" &&
+		os.Getenv("FG_REGISTRATION_MODE") != "email" &&
+		os.Getenv("FG_REGISTRATION_MODE") != "anonymous" {
+		log.Fatal("set FG_SINGLE_FAMILY=1 or explicitly enable a supported registration mode")
+	}
+	if os.Getenv("FG_REGISTRATION_MODE") == "anonymous" &&
+		(os.Getenv("FG_SINGLE_FAMILY") == "1" || strings.TrimSpace(os.Getenv("FG_ALERT_URL")) != "" ||
+			len(strings.TrimSpace(os.Getenv("FG_PLATFORM_ADMIN_TOKEN"))) < 32) {
+		log.Fatal("anonymous signup requires multifamily, a platform admin token, and isolated alerts")
+	}
+	if os.Getenv("FG_REGISTRATION_MODE") == "email" {
+		if os.Getenv("FG_SINGLE_FAMILY") == "1" || len(os.Getenv("FG_ACCOUNT_PEPPER")) < 32 ||
+			len(os.Getenv("FG_EMAIL_API_KEY")) < 20 || os.Getenv("FG_EMAIL_FROM") == "" ||
+			len(os.Getenv("FG_PLATFORM_ADMIN_TOKEN")) < 32 || os.Getenv("FG_ALERT_URL") != "" {
+			log.Fatal("email registration requires multifamily, mail API, account pepper, platform admin token and isolated alerts")
+		}
+	}
+	if os.Getenv("FG_REGISTRATION_MODE") == "invite" && os.Getenv("FG_SINGLE_FAMILY") != "1" &&
+		strings.TrimSpace(os.Getenv("FG_ALERT_URL")) != "" {
+		log.Fatal("multi-family invitation mode requires a tenant-isolated push provider; FG_ALERT_URL is a shared single-family topic")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	if config, err := newAlertConfigFromEnv(); err != nil {
 		log.Fatalf("alert config: %v", err)
 	} else if config != nil {
-		if os.Getenv("FG_SINGLE_FAMILY") != "1" || len(app.reg.Families) > 1 {
+		if os.Getenv("FG_SINGLE_FAMILY") != "1" || app.rootCountLocked() > 1 {
 			log.Fatal("FG_ALERT_URL requires FG_SINGLE_FAMILY=1 and at most one family; prevents cross-family alerts")
 		}
 		go runAlertLoop(ctx, app, config)
 		log.Printf("Emergency alert relay enabled (the phone must subscribe to the topic; delivery is not guaranteed)")
 	}
 	defer cancel()
+	go func() {
+		tick := time.NewTicker(30 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				app.checkOfflineAlerts(time.Now().UnixMilli())
+			}
+		}
+	}()
 	go func() {
 		tick := time.NewTicker(6 * time.Hour)
 		defer tick.Stop()

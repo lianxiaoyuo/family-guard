@@ -1,6 +1,7 @@
 package com.familyguard.app;
 
 import android.content.Context;
+import android.os.SystemClock;
 import android.database.Cursor;
 import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteOpenHelper;
@@ -11,6 +12,12 @@ import java.util.List;
 
 /** WAL queue with Keystore-encrypted position payloads. All calls from the service IO executor. */
 final class LocationQueue extends SQLiteOpenHelper {
+    // Last five minutes retain high-resolution fixes; older offline fixes are sampled
+    // at one per 30-second time bucket. Capacity covers approximately 72 hours.
+    private static final long RETAIN_MS=72L*60*60*1000;
+    private static final long HI_RES_MS=5L*60*1000;
+    private static final int MAX_POINTS=9500;
+    private long lastCompactElapsed=-60000L;
     LocationQueue(Context c){super(c,"pending_points.db",null,3);setWriteAheadLoggingEnabled(true);}
     @Override public void onCreate(SQLiteDatabase db){
         db.execSQL("CREATE TABLE pending(id TEXT PRIMARY KEY, encrypted TEXT NOT NULL, deviceTime INTEGER NOT NULL)");
@@ -43,9 +50,19 @@ final class LocationQueue extends SQLiteOpenHelper {
         db.beginTransaction();
         try {
             db.execSQL("INSERT OR IGNORE INTO pending VALUES(?,?,?)",new Object[]{id,cipher,ts});
-            // Bound storage even if a phone stays offline for hours or days.
-            db.execSQL("DELETE FROM pending WHERE deviceTime < ?",new Object[]{System.currentTimeMillis()-6L*24*60*60*1000});
-            db.execSQL("DELETE FROM pending WHERE id NOT IN (SELECT id FROM pending ORDER BY deviceTime DESC, rowid DESC LIMIT 1200)");
+            // Compact no more often than once a minute to avoid expensive work per fix.
+            long elapsed=SystemClock.elapsedRealtime();
+            if(elapsed-lastCompactElapsed>=60000L || lastCompactElapsed<0) {
+                long now=System.currentTimeMillis();
+                db.execSQL("DELETE FROM pending WHERE deviceTime < ?",new Object[]{now-RETAIN_MS});
+                long cutoff=now-HI_RES_MS;
+                db.execSQL("DELETE FROM pending WHERE deviceTime < ? AND rowid NOT IN ("+
+                        "SELECT MAX(rowid) FROM pending WHERE deviceTime < ? GROUP BY (deviceTime / 30000))",
+                        new Object[]{cutoff,cutoff});
+                db.execSQL("DELETE FROM pending WHERE rowid NOT IN ("+
+                        "SELECT rowid FROM pending ORDER BY deviceTime DESC, rowid DESC LIMIT "+MAX_POINTS+")");
+                lastCompactElapsed=elapsed;
+            }
             db.setTransactionSuccessful();
         }finally{db.endTransaction();}
     }
@@ -58,8 +75,8 @@ final class LocationQueue extends SQLiteOpenHelper {
         }
     }
     synchronized Batch next() throws Exception {
-        // Never allow a week-old offline record to block every new upload.
-        getWritableDatabase().execSQL("DELETE FROM pending WHERE deviceTime < ?",new Object[]{System.currentTimeMillis()-6L*24*60*60*1000});
+        // An expired offline record must never block live-position uploading.
+        getWritableDatabase().execSQL("DELETE FROM pending WHERE deviceTime < ?",new Object[]{System.currentTimeMillis()-RETAIN_MS});
         JSONArray a=new JSONArray();List<String> ids=new ArrayList<>();
         try(Cursor c=getReadableDatabase().rawQuery("SELECT id,encrypted FROM pending ORDER BY deviceTime ASC LIMIT 50",null)){
             while(c.moveToNext()){

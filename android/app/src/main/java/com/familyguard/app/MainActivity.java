@@ -5,6 +5,9 @@ import android.app.*;
 import android.content.*;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Paint;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
@@ -26,9 +29,22 @@ import com.amap.api.maps.model.Circle;
 import com.amap.api.maps.model.CircleOptions;
 import com.amap.api.maps.model.Polyline;
 import com.amap.api.maps.model.PolylineOptions;
+import com.amap.api.services.core.LatLonPoint;
+import com.amap.api.services.geocoder.GeocodeSearch;
+import com.amap.api.services.geocoder.GeocodeResult;
+import com.amap.api.services.geocoder.RegeocodeQuery;
+import com.amap.api.services.geocoder.RegeocodeResult;
+import android.location.Location;
 import org.json.JSONArray;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import com.amap.api.maps.model.LatLngBounds;
+import com.amap.api.maps.model.BitmapDescriptorFactory;
+import com.amap.api.maps.model.BitmapDescriptor;
 import org.json.JSONObject;
 import java.text.SimpleDateFormat;
 import java.util.Date;
@@ -40,10 +56,24 @@ public class MainActivity extends Activity {
     private final ExecutorService network=Executors.newSingleThreadExecutor();
     private final Handler handler=new Handler(Looper.getMainLooper());
     private LinearLayout body;
-    private EditText setupTokenField,codeField,nameField,recoveryField;
+    private EditText codeField,nameField,recoveryField;
     private String setupMode="";
+    private volatile String selectedChildId="";
+    private String selectedChildName="";
+    private JSONArray familyChildren=new JSONArray();
+    private LinearLayout childTabs;
+    private final Map<String,Marker> familyMarkers=new HashMap<>();
+    private final Map<String,BitmapDescriptor> childDotIcons=new HashMap<>();
+    private final Map<String,String> markerVisualStates=new HashMap<>();
+    private long lastChildrenFetch=0L;
+    private long lastFamilyEventFetch=0L;
+    private boolean familyEventsBusy=false;
+    private boolean childrenBusy=false;
     private TextView parentStatus, childStatus, pairText, guardStatus, mediaStatus;
     private String shownMediaRequest="", activeMediaID="", activeMediaKind="", lastGuardEvent="";
+    private boolean parentPaired=false;
+    private String parentChildName="";
+    private long parentLastSeen=0L;
     private File captureFile;
     private MediaRecorder audioRecorder;
     private long recordingStarted;
@@ -59,18 +89,32 @@ public class MainActivity extends Activity {
     private JSONObject latest;
     private String lastRenderedPointId="";
     private MapView mapView;
+    // Native view overlay, unlike AMap InfoWindow snapshots: accessible and clickable.
+    private FrameLayout mapFrame;
+    private LinearLayout locationOverlay;
+    private String locationOverlayChildId="";
+    private TextView overlayTitle,overlayChip,overlayAddress,overlayTime,
+            overlayAccuracy,overlayBattery,overlaySource;
+    private int selectedBattery=-1;
     private AMap map;
     private Marker marker;
     private Circle accuracyCircle;
     private final List<Polyline> routeLines=new ArrayList<>();
     private Bundle pendingMapState;
     private TextView historyStatus;
+    private TextView addressStatus;
+    // FG_V7_DASHBOARD_ADDRESS_PATCH: address belongs to a *location*, never to an unrelated device fix.
+    private GeocodeSearch addressSearch;
+    private LatLng addressedPoint;
+    private long addressAttemptElapsed = -120000L;
+    private String resolvedAddress = "正在解析附近地址…";
+    private boolean addressBusy = false;
     private String latestDiagnostics="";
     private boolean mapCentered=false, mapReady=false, followChild=true;
     private boolean started=false,loading=false;
     private final Runnable poll=new Runnable(){@Override public void run(){
         if(started && "parent".equals(Prefs.role(MainActivity.this))) {
-            fetchLatest();handler.postDelayed(this,AccuracyPolicy.PARENT_REFRESH_MS);
+            fetchLatest();loadFamilyEvents();handler.postDelayed(this,AccuracyPolicy.PARENT_REFRESH_MS);
         }
     }};
     int dp(float n){return (int)(n*getResources().getDisplayMetrics().density+0.5f);}
@@ -97,7 +141,8 @@ public class MainActivity extends Activity {
     private void releaseMap(){
         clearRouteLines();
         if(mapView!=null){try{mapView.onPause();mapView.onDestroy();}catch(Exception ignored){}mapView=null;}
-        map=null;marker=null;accuracyCircle=null;mapCentered=false;mapReady=false;followChild=true;lastRenderedPointId="";
+        map=null;mapFrame=null;locationOverlay=null;locationOverlayChildId="";
+        marker=null;familyMarkers.clear();childDotIcons.clear();markerVisualStates.clear();accuracyCircle=null;mapCentered=false;mapReady=false;followChild=true;lastRenderedPointId="";
     }
     private void clearRouteLines(){
         for(Polyline line:routeLines){try{line.remove();}catch(RuntimeException ignored){}}
@@ -107,13 +152,34 @@ public class MainActivity extends Activity {
         GradientDrawable d=new GradientDrawable();d.setColor(color);d.setCornerRadius(dp(18));
         if(stroke!=0)d.setStroke(dp(1),stroke);return d;
     }
+    private GradientDrawable roundBg(int color,int border,int radius){
+        GradientDrawable d=new GradientDrawable();d.setColor(color);d.setCornerRadius(dp(radius));
+        if(border!=0)d.setStroke(dp(1),border);return d;
+    }
+    private GradientDrawable gradientBg(int top,int bottom,int radius){
+        GradientDrawable d=new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,new int[]{top,bottom});
+        d.setCornerRadius(dp(radius));return d;
+    }
+    private TextView smallLabel(String value){
+        TextView t=text(value,11,Color.rgb(104,122,147),false);
+        t.setPadding(0,0,0,dp(3));return t;
+    }
     private void cardTitle(String heading,String summary){
-        TextView t=text(heading,19,Color.rgb(20,46,83),true);
-        LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,-2);
-        lp.topMargin=dp(14);lp.bottomMargin=dp(4);
-        t.setLayoutParams(lp);t.setPadding(dp(12),dp(14),dp(12),dp(12));
-        t.setBackground(bg(Color.rgb(231,241,252),0));add(t);
-        if(summary!=null&&!summary.isEmpty())line(summary);
+        LinearLayout column=new LinearLayout(this);column.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams box=new LinearLayout.LayoutParams(-1,-2);
+        box.topMargin=dp(17);box.bottomMargin=dp(11);column.setLayoutParams(box);
+        LinearLayout top=new LinearLayout(this);top.setOrientation(LinearLayout.HORIZONTAL);
+        top.setGravity(Gravity.CENTER_VERTICAL);
+        View accent=new View(this);accent.setBackground(roundBg(Color.rgb(39,112,222),0,2));
+        LinearLayout.LayoutParams lineLp=new LinearLayout.LayoutParams(dp(4),dp(20));lineLp.rightMargin=dp(10);
+        top.addView(accent,lineLp);
+        TextView title=text(heading,17,Color.rgb(27,49,83),true);title.setPadding(0,0,0,0);
+        top.addView(title);column.addView(top);
+        if(summary!=null&&!summary.isEmpty()){
+            TextView sub=text(summary,12,Color.rgb(110,125,149),false);
+            sub.setPadding(dp(14),dp(5),0,0);column.addView(sub);
+        }
+        add(column);
     }
     private void add(View v){body.addView(v);}
     private TextView text(String value,int size,int color,boolean bold){
@@ -126,10 +192,265 @@ public class MainActivity extends Activity {
     private Button btn(String label,boolean primary,Runnable cb){
         Button b=new Button(this);b.setText(label);b.setAllCaps(false);b.setTextSize(15);b.setTypeface(null,Typeface.BOLD);
         b.setTextColor(primary?Color.WHITE:Color.rgb(23,73,148));
-        b.setBackground(bg(primary?Color.rgb(30,97,210):Color.WHITE,primary?0:Color.rgb(222,232,246)));
+        b.setBackground(roundBg(primary?Color.rgb(35,104,216):Color.WHITE,
+                primary?0:Color.rgb(225,234,245),15));
         b.setElevation(dp(primary?3:1));
-        LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,dp(52));p.bottomMargin=dp(10);b.setLayoutParams(p);
+        LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,dp(50));p.bottomMargin=dp(9);b.setLayoutParams(p);
         b.setOnClickListener(v->cb.run());add(b);return b;
+    }
+    /** Two-column touch targets; only the parent dashboard uses these tiles. */
+    private LinearLayout actionTile(String symbol,String name,String desc,boolean featured,Runnable action){
+        LinearLayout tile=new LinearLayout(this);
+        tile.setOrientation(LinearLayout.VERTICAL);
+        tile.setGravity(Gravity.CENTER_VERTICAL);
+        tile.setPadding(dp(12),dp(10),dp(10),dp(9));
+        tile.setBackground(roundBg(featured?Color.rgb(237,245,255):Color.WHITE,
+                featured?Color.rgb(203,223,250):Color.rgb(228,235,246),16));
+        tile.setElevation(dp(1));
+        tile.setClickable(true);tile.setFocusable(true);
+        LinearLayout top=new LinearLayout(this);top.setOrientation(LinearLayout.HORIZONTAL);
+        top.setGravity(Gravity.CENTER_VERTICAL);
+        TextView iconView=text(symbol,17,Color.rgb(38,104,202),true);
+        iconView.setGravity(Gravity.CENTER);iconView.setPadding(0,0,0,0);
+        iconView.setBackground(roundBg(Color.rgb(223,237,255),0,10));
+        LinearLayout.LayoutParams iconLp=new LinearLayout.LayoutParams(dp(32),dp(32));iconLp.rightMargin=dp(8);
+        top.addView(iconView,iconLp);
+        TextView heading=text(name,14,Color.rgb(25,52,90),true);
+        heading.setPadding(0,0,0,0);heading.setSingleLine(true);
+        heading.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        top.addView(heading,new LinearLayout.LayoutParams(0,-2,1));tile.addView(top);
+        TextView detail=text(desc,11,Color.rgb(108,125,149),false);
+        detail.setPadding(0,dp(7),0,0);
+        detail.setMaxLines(1);detail.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        tile.addView(detail);
+        tile.setContentDescription(name+"，"+desc);
+        tile.setOnClickListener(v->action.run());return tile;
+    }
+    private void actionRow(String sym1,String name1,String desc1,boolean featured1,Runnable action1,
+                           String sym2,String name2,String desc2,boolean featured2,Runnable action2){
+        LinearLayout row=new LinearLayout(this);row.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams rowLp=new LinearLayout.LayoutParams(-1,dp(92));rowLp.bottomMargin=dp(9);
+        LinearLayout.LayoutParams left=new LinearLayout.LayoutParams(0,-1,1);
+        left.rightMargin=dp(10);
+        row.addView(actionTile(sym1,name1,desc1,featured1,action1),left);
+        row.addView(actionTile(sym2,name2,desc2,featured2,action2),
+                new LinearLayout.LayoutParams(0,-1,1));
+        row.setLayoutParams(rowLp);add(row);
+    }
+    /** A compact, real Android View over the map (InfoWindow itself is a static bitmap). */
+    private JSONObject childRow(String id){
+        for(int i=0;i<familyChildren.length();i++){
+            JSONObject child=familyChildren.optJSONObject(i);
+            if(child!=null && id.equals(child.optString("childId")))return child;
+        }
+        return null;
+    }
+    private JSONObject pointForChild(String id){
+        JSONObject row=childRow(id);
+        if(id.equals(selectedChildId) && latest!=null)return latest;
+        return row==null?null:row.optJSONObject("point");
+    }
+    private void hideLocationOverlay(){
+        locationOverlayChildId="";
+        if(locationOverlay!=null && mapFrame!=null)mapFrame.removeView(locationOverlay);
+        locationOverlay=null;
+        overlayTitle=null;overlayChip=null;overlayAddress=null;
+        overlayTime=null;overlayAccuracy=null;overlayBattery=null;overlaySource=null;
+    }
+    private void showLocationOverlay(String childId){
+        if(mapFrame==null||childId==null||childId.isEmpty())return;
+        if(!childId.equals(locationOverlayChildId))hideLocationOverlay();
+        locationOverlayChildId=childId;
+        refreshSelectedInfoWindow();
+    }
+    private LinearLayout statCell(String label,String value,int type){
+        LinearLayout cell=new LinearLayout(this);cell.setOrientation(LinearLayout.VERTICAL);
+        cell.setPadding(dp(9),dp(8),dp(6),dp(7));
+        cell.setBackground(roundBg(Color.rgb(242,247,253),0,10));
+        cell.addView(smallLabel(label));
+        TextView v=text(value,12,Color.rgb(29,57,96),true);
+        v.setSingleLine(true);v.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        v.setPadding(0,0,0,0);cell.addView(v);
+        if(type==0)overlayTime=v;
+        else if(type==1)overlayAccuracy=v;
+        else overlayBattery=v;
+        return cell;
+    }
+    private String compactTime(long millis){
+        return millis>0?new SimpleDateFormat("HH:mm:ss",Locale.CHINA).format(new Date(millis)):"暂无";
+    }
+    private String compactSource(String provider){
+        if("gps".equals(provider))return "卫星 GNSS";
+        if("amap".equals(provider))return "高德融合";
+        if("fused".equals(provider))return "系统融合";
+        if("network".equals(provider))return "网络定位";
+        return "来源未知";
+    }
+    /** All actions are native click targets: no unclickable controls inside AMap InfoWindow. */
+    private void refreshSelectedInfoWindow(){
+        if(mapFrame==null||locationOverlayChildId.isEmpty())return;
+        final String id=locationOverlayChildId;
+        JSONObject child=childRow(id),fix=pointForChild(id);
+        String name=child==null?selectedChildName:child.optString("childName","孩子");
+        if(name==null||name.trim().isEmpty())name="孩子";
+        long at=fix==null?0:fix.optLong("deviceTime",0);
+        long received=fix==null?0:fix.optLong("receivedAt",0);
+        long age=at>0?Math.max(System.currentTimeMillis()-at,received>0?System.currentTimeMillis()-received:0):Long.MAX_VALUE;
+        boolean stale=age>60000L;
+        int battery=id.equals(selectedChildId)&&selectedBattery>=0?selectedBattery:
+                (child==null?-1:child.optInt("battery",-1));
+        double accuracy=fix==null?Double.NaN:fix.optDouble("accuracy",Double.NaN);
+        String accuracyText=Double.isFinite(accuracy)&&accuracy>=0?
+                String.format(Locale.CHINA,"±%.0fm",accuracy):"未知";
+        String source=fix==null?"暂无定位":compactSource(fix.optString("provider",""));
+        String addr=fix==null?"等待孩子设备上传位置":id.equals(selectedChildId)?resolvedAddress:"切换后同步地址…";
+        if(locationOverlay!=null){
+            overlayTitle.setText(name);
+            overlayChip.setText(stale?"历史位置":"最新位置");
+            overlayChip.setTextColor(stale?Color.rgb(139,92,43):Color.rgb(19,119,103));
+            overlayChip.setBackground(roundBg(stale?Color.rgb(255,241,221):Color.rgb(221,247,239),0,9));
+            overlayAddress.setText(addr);
+            overlayTime.setText(compactTime(at));
+            overlayAccuracy.setText(accuracyText);
+            overlayBattery.setText(battery>=0?battery+"%":"未知");
+            String coord=fix==null?"暂无坐标":String.format(Locale.US,"%.5f, %.5f",
+                    fix.optDouble("lat"),fix.optDouble("lon"));
+            overlaySource.setText(source+"  ·  "+coord);
+            return;
+        }
+        LinearLayout card=new LinearLayout(this);card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(13),dp(12),dp(13),dp(11));
+        card.setBackground(gradientBg(Color.rgb(253,254,255),Color.rgb(247,250,255),20));
+        card.setElevation(dp(10));card.setFocusable(true);
+        int width=Math.min(dp(340),getResources().getDisplayMetrics().widthPixels-dp(62));
+        FrameLayout.LayoutParams frameLp=new FrameLayout.LayoutParams(width,-2,Gravity.BOTTOM|Gravity.CENTER_HORIZONTAL);
+        frameLp.bottomMargin=dp(13);
+        mapFrame.addView(card,frameLp);locationOverlay=card;
+
+        LinearLayout header=new LinearLayout(this);header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        View childDot=new View(this);childDot.setBackground(roundBg(childColor(id),0,8));
+        LinearLayout.LayoutParams dotLp=new LinearLayout.LayoutParams(dp(11),dp(11));dotLp.rightMargin=dp(9);
+        header.addView(childDot,dotLp);
+        TextView title=text(name,16,Color.rgb(24,48,81),true);
+        overlayTitle=title;
+        title.setSingleLine(true);title.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        title.setPadding(0,0,dp(6),0);header.addView(title,new LinearLayout.LayoutParams(0,-2,1));
+        TextView chip=text(stale?"历史位置":"最新位置",10,
+                stale?Color.rgb(139,92,43):Color.rgb(19,119,103),true);
+        overlayChip=chip;
+        chip.setPadding(dp(8),dp(5),dp(8),dp(5));
+        chip.setBackground(roundBg(stale?Color.rgb(255,241,221):Color.rgb(221,247,239),0,9));
+        header.addView(chip);
+        TextView close=text("×",23,Color.rgb(105,122,147),false);
+        close.setGravity(Gravity.CENTER);close.setPadding(0,0,0,0);
+        LinearLayout.LayoutParams closeLp=new LinearLayout.LayoutParams(dp(35),dp(38));
+        closeLp.leftMargin=dp(2);header.addView(close,closeLp);
+        close.setContentDescription("关闭位置详情");close.setOnClickListener(v->hideLocationOverlay());
+        card.addView(header);
+
+        LinearLayout divider=new LinearLayout(this);
+        divider.setBackgroundColor(Color.rgb(232,238,247));
+        LinearLayout.LayoutParams dividerLp=new LinearLayout.LayoutParams(-1,dp(1));
+        dividerLp.topMargin=dp(6);dividerLp.bottomMargin=dp(9);card.addView(divider,dividerLp);
+
+        card.addView(smallLabel("附近地址"));
+        TextView address=text(addr,13,Color.rgb(32,60,95),true);
+        overlayAddress=address;
+        address.setPadding(0,0,0,dp(8));address.setMaxLines(2);
+        address.setEllipsize(android.text.TextUtils.TruncateAt.END);card.addView(address);
+
+        LinearLayout stats=new LinearLayout(this);stats.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams stat1=new LinearLayout.LayoutParams(0,-2,1);
+        stat1.rightMargin=dp(5);stats.addView(statCell("定位时间",compactTime(at),0),stat1);
+        LinearLayout.LayoutParams stat2=new LinearLayout.LayoutParams(0,-2,1);
+        stat2.rightMargin=dp(5);stats.addView(statCell("定位精度",accuracyText,1),stat2);
+        stats.addView(statCell("手机电量",battery>=0?battery+"%":"未知",2),new LinearLayout.LayoutParams(0,-2,1));
+        card.addView(stats);
+
+        LinearLayout footer=new LinearLayout(this);footer.setGravity(Gravity.CENTER_VERTICAL);
+        footer.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams footerLp=new LinearLayout.LayoutParams(-1,dp(38));
+        footerLp.topMargin=dp(5);card.addView(footer,footerLp);
+        String coord=fix==null?"暂无坐标":String.format(Locale.US,"%.5f, %.5f",
+                fix.optDouble("lat"),fix.optDouble("lon"));
+        TextView detail=text(source+"  ·  "+coord,10,Color.rgb(108,123,147),false);
+        overlaySource=detail;
+        detail.setSingleLine(true);detail.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        detail.setPadding(0,0,dp(4),0);footer.addView(detail,new LinearLayout.LayoutParams(0,-2,1));
+        TextView go=text("高德查看 ›",12,Color.rgb(34,101,205),true);
+        go.setGravity(Gravity.CENTER);go.setPadding(dp(7),dp(7),dp(3),dp(7));
+        go.setContentDescription("在高德地图查看"+name+"的位置");
+        go.setOnClickListener(v->openMapForChild(id));footer.addView(go);
+    }
+    private void updateAddressDetails(){
+        if(addressStatus!=null)addressStatus.setText("⌖  "+resolvedAddress);
+        if(marker!=null)marker.setSnippet(resolvedAddress);
+        refreshSelectedInfoWindow();
+    }
+    /** Switching children while a previous geocode is in flight must not strand the new address. */
+    private void retryMissingAddressForSelectedChild(){
+        if(!mapReady||latest==null||addressBusy||addressedPoint!=null)return;
+        double lat=latest.optDouble("lat",Double.NaN),lon=latest.optDouble("lon",Double.NaN);
+        String type=latest.optString("coordType","wgs84");
+        if(!Double.isFinite(lat)||!Double.isFinite(lon)||Math.abs(lat)>90||Math.abs(lon)>180||
+                !("gcj02".equals(type)||"wgs84".equals(type)))return;
+        resolvePointAddress(toAmapPoint(lat,lon,type));
+    }
+    /** Throttled GCJ-02 reverse geocoding; errors are shown as errors, never fabricated addresses. */
+    private void resolvePointAddress(LatLng point){
+        if(point==null||!AmapPrivacy.agreed(this))return;
+        float[] metres=new float[1];
+        if(addressedPoint!=null){
+            Location.distanceBetween(addressedPoint.latitude,addressedPoint.longitude,
+                    point.latitude,point.longitude,metres);
+            if(metres[0]<75f)return; // Keep address for small GNSS drift; don't exhaust quota.
+        }
+        if(addressBusy||SystemClock.elapsedRealtime()-addressAttemptElapsed<12000L)return;
+        final LatLng queryPoint=point;
+        addressAttemptElapsed=SystemClock.elapsedRealtime();
+        addressedPoint=queryPoint;
+        addressBusy=true;
+        resolvedAddress="正在解析附近地址…";
+        updateAddressDetails();
+        try{
+            if(addressSearch==null){
+                addressSearch=new GeocodeSearch(this);
+                addressSearch.setOnGeocodeSearchListener(new GeocodeSearch.OnGeocodeSearchListener(){
+                    @Override public void onRegeocodeSearched(RegeocodeResult result,int code){
+                        runOnUiThread(()->{
+                            addressBusy=false;
+                            if(addressedPoint==null||latest==null)return;
+                            LatLng current=toAmapPoint(latest.optDouble("lat"),latest.optDouble("lon"),
+                                    latest.optString("coordType","wgs84"));
+                            float[] difference=new float[1];
+                            Location.distanceBetween(addressedPoint.latitude,addressedPoint.longitude,
+                                    current.latitude,current.longitude,difference);
+                            if(difference[0]>=150f){
+                                addressedPoint=null;
+                                resolvedAddress="位置已变化，等待更新地址…";
+                                updateAddressDetails();return;
+                            }
+                            String found=(code==1000 && result!=null && result.getRegeocodeAddress()!=null)
+                                    ?result.getRegeocodeAddress().getFormatAddress():null;
+                            resolvedAddress=found!=null&&!found.trim().isEmpty()?found.trim()
+                                    :"暂时无法解析详细地址，可查看坐标";
+                            if(found==null||found.trim().isEmpty())addressedPoint=null;
+                            updateAddressDetails();
+                        });
+                    }
+                    @Override public void onGeocodeSearched(GeocodeResult r,int code){}
+                });
+            }
+            addressSearch.getFromLocationAsyn(new RegeocodeQuery(
+                    new LatLonPoint(queryPoint.latitude,queryPoint.longitude),200,GeocodeSearch.AMAP));
+        }catch(Exception ex){
+            addressBusy=false;
+            addressedPoint=null;
+            resolvedAddress="地址解析失败，可查看坐标";
+            updateAddressDetails();
+            android.util.Log.w("FamilyGuard","Reverse geocode unavailable",ex);
+        }
     }
     private EditText input(String hint,String value){
         EditText x=new EditText(this);x.setSingleLine(true);x.setTextSize(15);x.setTextColor(Color.rgb(36,45,65));x.setHint(hint);x.setText(value);
@@ -138,11 +459,11 @@ public class MainActivity extends Activity {
     }
     private void show(String message){Toast.makeText(this,message,Toast.LENGTH_LONG).show();}
     private void render(){
-        guardStatus=null;mediaStatus=null;
+        guardStatus=null;mediaStatus=null;addressStatus=null;
         releaseMap();
         ScrollView scroll=new ScrollView(this);scroll.setFillViewport(true);scroll.setBackgroundColor(Color.rgb(248,250,254));
         body=new LinearLayout(this);body.setOrientation(LinearLayout.VERTICAL);body.setPadding(dp(20),dp(14),dp(20),dp(40));scroll.addView(body);setContentView(scroll);
-        TextView brand=text("●  FAMILYGUARD  ·  家庭守护",13,Color.rgb(37,105,240),true);
+        TextView brand=text("●  FAMILYGUARD  ·  独立家庭守护",13,Color.rgb(37,105,240),true);
         brand.setPadding(dp(4),dp(8),dp(4),dp(12));add(brand);
         if(Prefs.role(this).isEmpty())setup();
         else if("parent".equals(Prefs.role(this)))parent();
@@ -150,40 +471,82 @@ public class MainActivity extends Activity {
     }
     private void setup(){
         title("家庭安全守护");
-        line("家庭服务器已自动配置，无需填写网址。首次使用请根据手机身份选择入口。共享位置需在孩子手机上明确授权，可以随时停止。" );
-        if ("parent".equals(setupMode)) {
-            setupParent();
-        } else if ("child".equals(setupMode)) {
+        line("同一 APK，家庭之间完全独立。家长不用手机号、邮箱或邀请码；孩子通过配对码加入。请妥善保存恢复密钥，遗失后无法找回家庭。 ");
+        if("create".equals(setupMode)){
+            setupCreateFamily();
+        }else if("recover".equals(setupMode)){
+            setupRecoverFamily();
+        }else if("child".equals(setupMode)){
             setupChild();
-        } else {
-            title("请选择这部手机的身份");
-            btn("我是家长 · 创建或恢复家庭",true,()->{setupMode="parent";render();});
+        }else if("guardian".equals(setupMode)){
+            setupGuardian();
+        }else{
+            title("请选择这部手机的用途");
+            btn("我是家长 · 免费创建家庭",true,()->{setupMode="create";render();});
             btn("我是孩子 · 输入配对码",false,()->{setupMode="child";render();});
+            btn("已有家庭 · 使用恢复密钥",false,()->{setupMode="recover";render();});
+            btn("我是其他监护人 · 加入家庭",false,()->{setupMode="guardian";render();});
         }
     }
-    private void setupParent(){
-        title("家长端 · 首次创建家庭");
-        line("首次创建需要部署时生成的初始化密钥。此密钥只在创建家庭时使用，不保存在 App 内。" );
-        setupTokenField=input("首次部署初始化密钥", "");
-        setupTokenField.setTransformationMethod(android.text.method.PasswordTransformationMethod.getInstance());
-        btn("创建家庭并获取配对码",true,()->{
-            final String initialSetupKey=setupTokenField.getText().toString().trim();
-            if(initialSetupKey.isEmpty()){show("请输入初始化密钥");return;}
-            request(()->Api.call(this,"POST","/v1/families",new JSONObject(),initialSetupKey),r->{
-                Prefs.setIdentity(this,"parent",r.getString("token"));render();
-                saveDisplayedPairCode(r.optString("pairCode"));
-                showRecoveryKey(r.getString("recoveryKey"));
+    private void setupCreateFamily(){
+        title("创建独立家庭 · 无需注册");
+        line("创建后自动生成家庭身份和 64 位恢复密钥；与你以外的家庭严格隔离。不需要邮件、短信或平台邀请码。");
+        EditText familyName=input("家庭名称（可选）","我的家庭");
+        btn("立即创建我的家庭",true,()->{
+            String name=familyName.getText().toString().trim();
+            if(name.isEmpty())name="我的家庭";
+            if(name.codePointCount(0,name.length())>32){show("家庭名称最多 32 字");return;}
+            final String finalName=name;
+            request(()->Api.call(this,"GET","/v1/registration/status",null,null),status->{
+                if(!status.optBoolean("available",false)){
+                    show("服务器尚未开放免注册创建家庭。原有家庭仍可用恢复密钥登录。");
+                    return;
+                }
+                new AlertDialog.Builder(this).setTitle("确认创建家庭")
+                    .setMessage("无需账号，但恢复密钥是换机找回家庭的唯一凭证。请确保能够安全保存。")
+                    .setNegativeButton("返回",null)
+                    .setPositiveButton("确认创建",(d,w)->request(
+                        ()->Api.call(this,"POST","/v1/families",new JSONObject().put("name",finalName),null),result->{
+                            Prefs.setIdentity(this,"parent",result.getString("token"));
+                            render();
+                            saveDisplayedPairCode(result.optString("pairCode"));
+                            showRecoveryKey(result.getString("recoveryKey"));
+                        })).show();
             });
         });
-        title("已有家庭 · 恢复家长访问");
-        line("只有在家长手机遗失或更换、无法访问原账号时才使用恢复密钥。恢复后旧家长令牌会失效。" );
-        recoveryField=input("64 位家长恢复密钥","");
+        btn("返回",false,()->{setupMode="";render();});
+    }
+    private void setupRecoverFamily(){
+        title("恢复已有家庭");
+        line("在新家长手机输入最初保存的 64 位恢复密钥。恢复成功会让旧家长设备的管理员令牌失效；已加入的孩子不会被删除。 ");
+        recoveryField=input("64 位恢复密钥","");
         recoveryField.setTransformationMethod(android.text.method.PasswordTransformationMethod.getInstance());
-        btn("恢复家长账号",false,()->{
+        btn("恢复我的家庭",true,()->{
             String key=recoveryField.getText().toString().trim();
-            if(!key.matches("[0-9a-fA-F]{64}")){show("请输入完整的 64 位恢复密钥");return;}
-            request(()->Api.call(this,"POST","/v1/recover",new JSONObject().put("recoveryKey",key),null),r->{
-                Prefs.setIdentity(this,"parent",r.getString("token"));render();showRecoveryKey(r.getString("recoveryKey"));
+            if(!key.matches("[0-9a-fA-F]{64}")){show("请输入完整的64位恢复密钥");return;}
+            new AlertDialog.Builder(this).setTitle("确认换机恢复")
+                .setMessage("继续后旧家长设备的登录令牌会失效，并生成新的恢复密钥，必须重新保存。")
+                .setNegativeButton("取消",null)
+                .setPositiveButton("确认恢复",(d,w)->request(
+                    ()->Api.call(this,"POST","/v1/recover",new JSONObject().put("recoveryKey",key),null),r->{
+                        Prefs.setIdentity(this,"parent",r.getString("token"));
+                        render();showRecoveryKey(r.getString("recoveryKey"));
+                    })).show();
+        });
+        btn("返回",false,()->{setupMode="";render();});
+    }
+    private void setupGuardian(){
+        title("加入现有家庭 · 家长或监护人");
+        line("由家庭管理员发送监护人邀请码。加入后可以查看该家庭的孩子位置，无需新建家庭。");
+        EditText invite=input("监护人邀请码（24位）","");
+        EditText name=input("你的称呼","");
+        btn("加入家庭",true,()->{
+            String code=invite.getText().toString().trim();String guardian=name.getText().toString().trim();
+            if(!code.matches("[0-9a-fA-F]{24}")||guardian.isEmpty()){show("请输入24位邀请码和称呼");return;}
+            request(()->Api.call(this,"POST","/v1/members/join",
+                    new JSONObject().put("code",code).put("name",guardian),null),r->{
+                Prefs.setIdentity(this,"parent",r.getString("token"));render();
+                show("已加入家庭："+r.optString("familyName","我的家庭"));
             });
         });
         btn("返回选择身份",false,()->{setupMode="";render();});
@@ -303,18 +666,33 @@ public class MainActivity extends Activity {
                     return super.dispatchTouchEvent(event);
                 }
             };
+            mapFrame=new FrameLayout(this);
+            mapFrame.setBackground(roundBg(Color.WHITE,Color.rgb(227,234,246),19));
+            mapFrame.setElevation(dp(2));
+            mapFrame.setClipToOutline(true);
             LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,dp(460));
             lp.bottomMargin=dp(12);
-            mapView.setLayoutParams(lp);
-            body.addView(mapView);
+            body.addView(mapFrame,lp);
+            mapFrame.addView(mapView,new FrameLayout.LayoutParams(-1,-1));
             Bundle state=pendingMapState;pendingMapState=null;
             mapView.onCreate(state);
             if(started)mapView.onResume();
             map=mapView.getMap();
             map.setMapType(AMap.MAP_TYPE_NORMAL);
             map.setTrafficEnabled(false);
+            // Native overlay is compact and interactive, unlike SDK InfoWindow snapshots.
+            map.setOnMarkerClickListener(m->{
+                Object tag=m.getObject();
+                String id=tag instanceof String?(String)tag:"";
+                if(id.isEmpty())return true;
+                if(id.equals(locationOverlayChildId)){hideLocationOverlay();return true;}
+                if(!id.equals(selectedChildId))selectChild(id);
+                showLocationOverlay(id);
+                return true;
+            });
+            map.setOnMapClickListener(p->hideLocationOverlay());
             map.setOnMapLoadedListener(()->android.util.Log.i("FamilyGuard.AMap","AMap map tiles loaded"));
-            map.getUiSettings().setZoomControlsEnabled(true);
+            map.getUiSettings().setZoomControlsEnabled(false);
             map.getUiSettings().setZoomGesturesEnabled(true);
             map.getUiSettings().setScrollGesturesEnabled(true);
             map.getUiSettings().setRotateGesturesEnabled(true);
@@ -350,67 +728,280 @@ public class MainActivity extends Activity {
         String type=p.optString("coordType","wgs84");
         if(!"gcj02".equals(type)&&!"wgs84".equals(type))return;
         LatLng point=toAmapPoint(lat,lon,type);
-        if(marker==null)marker=map.addMarker(new MarkerOptions().position(point).title("孩子最新位置").snippet("定位来源："+locationSourceLabel(p.optString("provider",""))));
-        else{marker.setPosition(point);marker.setSnippet("定位来源："+locationSourceLabel(p.optString("provider","")));}
-        double radius=Math.min(3000d,Math.max(1d,p.optDouble("accuracy",100d)));
-        if(accuracyCircle==null){
-            accuracyCircle=map.addCircle(new CircleOptions().center(point).radius(radius)
-                    .strokeWidth(2f).strokeColor(Color.rgb(40,116,240))
-                    .fillColor(Color.argb(38,40,116,240)).zIndex(5f));
-        }else{accuracyCircle.setCenter(point);accuracyCircle.setRadius(radius);}
+        Marker selected=familyMarkers.get(selectedChildId);
+        if(selected!=null){
+            marker=selected;marker.setPosition(point);marker.setSnippet(resolvedAddress);
+        }else if(marker==null || (marker.getObject() instanceof String &&
+                !selectedChildId.equals(marker.getObject()))){
+            marker=map.addMarker(new MarkerOptions().position(point)
+                    .title(selectedChildName.isEmpty()?"孩子":selectedChildName)
+                    .icon(childDotIcon(selectedChildId,true)).anchor(0.5f,0.5f));
+            if(!selectedChildId.isEmpty()){
+                marker.setObject(selectedChildId);familyMarkers.put(selectedChildId,marker);
+                markerVisualStates.put(selectedChildId,childColor(selectedChildId)+":selected");
+            }
+        }else{marker.setPosition(point);marker.setSnippet(resolvedAddress);}
+        resolvePointAddress(point);
+        // Keep the map visually clean: accuracy stays visible in the detail card,
+        // not as a huge blue translucent circle around the child.
+        if(accuracyCircle!=null){accuracyCircle.remove();accuracyCircle=null;}
         if(!mapCentered){map.moveCamera(CameraUpdateFactory.newLatLngZoom(point,17f));mapCentered=true;}
         else if(followChild) map.animateCamera(CameraUpdateFactory.newLatLng(point));
     }
+
     private void addHistorySegment(List<LatLng> segment){
         if(map==null||segment==null||segment.size()<2)return;
         routeLines.add(map.addPolyline(new PolylineOptions().addAll(segment).width(6f)
                 .color(Color.rgb(5,153,122)).geodesic(true).zIndex(4f)));
     }
-    private void parent(){
-        title("孩子的位置");
-        pairText=text("正在连接孩子设备…",17,Color.rgb(30,69,129),true);add(pairText);
-        // The live map is the primary control, not a section buried below diagnostics.
-        installLiveMap();
-        btn("◎ 回到孩子最新位置",false,()->{
-            followChild=true;
-            if(map!=null && latest!=null){
-                String type=latest.optString("coordType","wgs84");
-                if("wgs84".equals(type)||"gcj02".equals(type)){
-                    double lat=latest.optDouble("lat",Double.NaN), lon=latest.optDouble("lon",Double.NaN);
-                    if(Double.isFinite(lat)&&Double.isFinite(lon)){
-                        map.animateCamera(CameraUpdateFactory.newLatLngZoom(toAmapPoint(lat,lon,type),17f));
-                        mapCentered=true;
-                    }
-                }
-            }
-        });
-        line("拖动或双指缩放地图后，会暂停自动居中；点击上方按钮继续跟随。");
-        parentStatus=text("正在同步孩子位置…",15,Color.rgb(33,62,96),false);add(parentStatus);
-        btn("查看定位技术详情",false,()->new AlertDialog.Builder(this)
-                .setTitle("定位数据与来源")
-                .setMessage(latestDiagnostics.isEmpty()?"还没有收到有效位置":latestDiagnostics)
-                .setPositiveButton("知道了",null).show());
-
-        cardTitle("快捷操作","实时地图是首页；更多操作在对应功能里完成。");
-        btn("查看历史轨迹",false,this::showHistoryPicker);
-        historyStatus=text("",13,Color.rgb(65,87,118),false);add(historyStatus);
-        btn("设置安全区域（地图选择）",true,this::openFenceEditor);
-        guardStatus=text("安全区域：正在加载…",14,Color.rgb(60,76,102),false);add(guardStatus);
-        btn("照片 · 录音 · 视频协助",false,this::showAssistancePicker);
-        mediaStatus=text("",13,Color.rgb(65,87,118),false);add(mediaStatus);
-        btn("查看孩子发来的照片或录音",false,this::downloadLatestMedia);
-
-        cardTitle("家庭管理","日常不需要这些操作。");
-        if(Build.VERSION.SDK_INT>=33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED){
-            btn("开启安全通知（SOS / 进出围栏）",false,()->requestPermissions(
-                    new String[]{Manifest.permission.POST_NOTIFICATIONS},401));
+    private String childPath(String path){
+        String id=selectedChildId;
+        return id.isEmpty()?path:path+(path.contains("?")?"&":"?")+"childId="+Uri.encode(id);
+    }
+    private void selectChild(String id){
+        if(id==null||id.isEmpty())return;
+        final String previous=selectedChildId;
+        selectedChildId=id;
+        Marker old=familyMarkers.get(previous);
+        if(old!=null && !previous.equals(id))styleChildMarker(old,previous,false);
+        Marker current=familyMarkers.get(id);
+        if(current!=null)styleChildMarker(current,id,true);
+        marker=current;
+        lastRenderedPointId="";latest=null;mapCentered=false;
+        addressedPoint=null;addressAttemptElapsed=-120000L;
+        resolvedAddress="正在解析附近地址…";updateAddressDetails();
+        if(accuracyCircle!=null){accuracyCircle.remove();accuracyCircle=null;}
+        rebuildChildTabs();
+        if(!locationOverlayChildId.isEmpty()){
+            hideLocationOverlay();locationOverlayChildId=id;refreshSelectedInfoWindow();
         }
-        btn("生成新的孩子配对码",false,()->request(()->Api.call(this,"POST","/v1/pair",new JSONObject(),Prefs.token(this)),
-                result->saveDisplayedPairCode(result.optString("pairCode"))));
-        btn("检查 App 更新",false,()->UpdateManager.check(this,true));
-        btn("打开高德查看孩子位置",false,this::openMap);
         fetchLatest();loadGuard();loadMediaList();
     }
+    /** Plain colored dot + text, without the old oval/pill background around a child's name. */
+    private void rebuildChildTabs(){
+        if(childTabs==null)return;
+        childTabs.removeAllViews();
+        for(int i=0;i<familyChildren.length();i++){
+            JSONObject child=familyChildren.optJSONObject(i);if(child==null)continue;
+            String id=child.optString("childId"), name=child.optString("childName","孩子");
+            boolean selected=id.equals(selectedChildId);
+            LinearLayout item=new LinearLayout(this);
+            item.setOrientation(LinearLayout.HORIZONTAL);
+            item.setGravity(Gravity.CENTER_VERTICAL);
+            item.setMinimumHeight(dp(46));
+            item.setPadding(dp(8),0,dp(8),0);
+            View dot=new View(this);
+            GradientDrawable circle=new GradientDrawable();
+            circle.setShape(GradientDrawable.OVAL);
+            circle.setColor(childColor(id));
+            dot.setBackground(circle);
+            item.addView(dot,new LinearLayout.LayoutParams(dp(10),dp(10)));
+            TextView label=text(name,14,selected?childColor(id):Color.rgb(59,80,111),selected);
+            label.setPadding(dp(7),0,dp(5),0);
+            if(selected)label.setPaintFlags(label.getPaintFlags()|Paint.UNDERLINE_TEXT_FLAG);
+            item.addView(label);
+            item.setClickable(true);
+            item.setFocusable(true);
+            item.setContentDescription("查看孩子："+name);
+            LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-2,dp(46));
+            lp.rightMargin=dp(10);
+            childTabs.addView(item,lp);
+            item.setOnClickListener(v->selectChild(id));
+        }
+    }
+    private void showAllChildren(){
+        if(map==null||familyMarkers.isEmpty()){show("暂无孩子位置");return;}
+        LatLngBounds.Builder bounds=new LatLngBounds.Builder();int found=0;Marker single=null;
+        for(Marker m:familyMarkers.values()){bounds.include(m.getPosition());found++;single=m;}
+        try{
+            followChild=false;
+            if(found==1 && single!=null)map.animateCamera(CameraUpdateFactory.newLatLngZoom(single.getPosition(),16f));
+            else map.animateCamera(CameraUpdateFactory.newLatLngBounds(bounds.build(),dp(70)));
+        }catch(RuntimeException ex){show("地图调整失败，请稍后重试");}
+    }
+    /** Stable, accessible color per family device; nothing but circles on the map. */
+    private static final int[] CHILD_DOT_COLORS={
+            Color.rgb(36,112,217),Color.rgb(0,151,130),Color.rgb(159,80,201),
+            Color.rgb(220,110,36),Color.rgb(215,70,114),Color.rgb(91,139,45),
+            Color.rgb(185,137,27),Color.rgb(19,151,184)
+    };
+    private int childColor(String id){
+        for(int i=0;i<familyChildren.length();i++){
+            JSONObject c=familyChildren.optJSONObject(i);
+            if(c!=null && id.equals(c.optString("childId")))return CHILD_DOT_COLORS[i%CHILD_DOT_COLORS.length];
+        }
+        return CHILD_DOT_COLORS[(id==null?0:(id.hashCode()&0x7fffffff))%CHILD_DOT_COLORS.length];
+    }
+    /** 40dp bitmap is easy to tap; the visible center is a clean ~20dp colored dot. */
+    private BitmapDescriptor childDotIcon(String id,boolean selected){
+        String key=id+":"+childColor(id)+":"+(selected?"selected":"normal");
+        BitmapDescriptor cached=childDotIcons.get(key);
+        if(cached!=null)return cached;
+        int px=dp(40);
+        Bitmap image=Bitmap.createBitmap(px,px,Bitmap.Config.ARGB_8888);
+        Canvas canvas=new Canvas(image);
+        Paint paint=new Paint(Paint.ANTI_ALIAS_FLAG);
+        float center=px/2f;
+        if(selected){
+            paint.setColor(Color.argb(55,36,112,217));
+            canvas.drawCircle(center,center,dp(18),paint);
+        }
+        paint.setColor(Color.argb(45,23,45,78));
+        canvas.drawCircle(center,center+dp(1),dp(13),paint);
+        paint.setColor(Color.WHITE);
+        canvas.drawCircle(center,center,dp(13),paint);
+        paint.setColor(childColor(id));
+        canvas.drawCircle(center,center,dp(10),paint);
+        if(selected){
+            paint.setColor(Color.WHITE);
+            canvas.drawCircle(center,center,dp(2),paint);
+        }
+        BitmapDescriptor icon=BitmapDescriptorFactory.fromBitmap(image);
+        childDotIcons.put(key,icon);
+        return icon;
+    }
+    private void styleChildMarker(Marker target,String id,boolean selected){
+        String desired=childColor(id)+":"+(selected?"selected":"normal");
+        if(!desired.equals(markerVisualStates.get(id))){
+            target.setIcon(childDotIcon(id,selected));
+            markerVisualStates.put(id,desired);
+        }
+    }
+    private void fetchChildren(){
+        if(childrenBusy||!started||!"parent".equals(Prefs.role(this))||System.currentTimeMillis()-lastChildrenFetch<4000L)return;
+        childrenBusy=true;lastChildrenFetch=System.currentTimeMillis();
+        network.execute(()->{
+            try{
+                JSONObject result=Api.call(this,"GET","/v1/children",null,Prefs.token(this));
+                runOnUiThread(()->{
+                    childrenBusy=false;
+                    familyChildren=result.optJSONArray("children");if(familyChildren==null)familyChildren=new JSONArray();
+                    String existing=selectedChildId;
+                    boolean exists=false;
+                    for(int i=0;i<familyChildren.length();i++){
+                        JSONObject child=familyChildren.optJSONObject(i);
+                        if(child!=null && existing.equals(child.optString("childId"))){exists=true;break;}
+                    }
+                    if(!exists){
+                        if(marker!=null && !familyMarkers.containsValue(marker)){marker.remove();marker=null;}
+                        if(familyChildren.length()>0)selectedChildId=familyChildren.optJSONObject(0).optString("childId");
+                        else selectedChildId=result.optString("familyId","");
+                        lastRenderedPointId="";
+                    }
+                    if(map!=null){
+                        Set<String> live=new HashSet<>();
+                        for(int i=0;i<familyChildren.length();i++){
+                            JSONObject child=familyChildren.optJSONObject(i);if(child==null)continue;
+                            String id=child.optString("childId"),name=child.optString("childName","孩子");
+                            JSONObject fix=child.optJSONObject("point");
+                            if(id.isEmpty()||fix==null)continue;
+                            double lat=fix.optDouble("lat",Double.NaN),lon=fix.optDouble("lon",Double.NaN);
+                            String type=fix.optString("coordType","wgs84");
+                            if(!Double.isFinite(lat)||!Double.isFinite(lon)||Math.abs(lat)>90||Math.abs(lon)>180||
+                                    !("gcj02".equals(type)||"wgs84".equals(type)))continue;
+                            live.add(id);
+                            LatLng p=toAmapPoint(lat,lon,type);
+                            Marker childMarker=familyMarkers.get(id);
+                            if(childMarker==null){
+                                childMarker=map.addMarker(new MarkerOptions().position(p).title(name)
+                                    .icon(childDotIcon(id,id.equals(selectedChildId))).anchor(0.5f,0.5f));
+                                childMarker.setObject(id);familyMarkers.put(id,childMarker);
+                                markerVisualStates.put(id,childColor(id)+":"+
+                                        (id.equals(selectedChildId)?"selected":"normal"));
+                            }else{
+                                childMarker.setPosition(p);childMarker.setTitle(name);
+                                styleChildMarker(childMarker,id,id.equals(selectedChildId));
+                            }
+                            childMarker.setAlpha(System.currentTimeMillis()-fix.optLong("deviceTime",0)>60000L?0.55f:1f);
+                        }
+                        for(String id:new ArrayList<>(familyMarkers.keySet()))if(!live.contains(id)){
+                            Marker stale=familyMarkers.remove(id);if(stale!=null)stale.remove();
+                            markerVisualStates.remove(id);
+                            if(id.equals(selectedChildId))marker=null;
+                        }
+                        marker=familyMarkers.get(selectedChildId);
+                    }
+                    rebuildChildTabs();
+                    if(!locationOverlayChildId.isEmpty())refreshSelectedInfoWindow();
+                    if(!exists)fetchLatest();
+                });
+            }catch(Exception e){runOnUiThread(()->{childrenBusy=false;if(childTabs!=null&&childTabs.getChildCount()==0)show("读取家庭设备列表失败："+e.getMessage());});}
+        });
+    }
+    private void parent(){
+        title("家庭守护");
+        pairText=text("●  正在连接家庭设备…",13,Color.rgb(47,106,174),true);
+        pairText.setPadding(dp(12),dp(10),dp(12),dp(10));
+        pairText.setBackground(roundBg(Color.rgb(235,245,255),0,12));
+        LinearLayout.LayoutParams pairLp=new LinearLayout.LayoutParams(-1,-2);
+        pairLp.bottomMargin=dp(9);pairText.setLayoutParams(pairLp);add(pairText);
+        HorizontalScrollView tabs=new HorizontalScrollView(this);tabs.setHorizontalScrollBarEnabled(false);
+        childTabs=new LinearLayout(this);childTabs.setOrientation(LinearLayout.HORIZONTAL);
+        tabs.addView(childTabs);LinearLayout.LayoutParams tabLp=new LinearLayout.LayoutParams(-1,dp(54));add(tabs);
+        rebuildChildTabs();
+        installLiveMap();
+        LinearLayout locationCard=new LinearLayout(this);
+        locationCard.setOrientation(LinearLayout.VERTICAL);
+        locationCard.setPadding(dp(15),dp(12),dp(15),dp(13));
+        locationCard.setBackground(gradientBg(Color.rgb(238,246,255),Color.WHITE,17));
+        locationCard.setElevation(dp(1));
+        LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,-2);lp.bottomMargin=dp(13);
+        locationCard.setLayoutParams(lp);
+        addressStatus=text("⌖  "+resolvedAddress,15,Color.rgb(26,64,117),true);
+        locationCard.addView(addressStatus);
+        parentStatus=text("正在同步孩子位置…",13,Color.rgb(95,111,134),false);
+        locationCard.addView(parentStatus);
+        add(locationCard);
+        actionRow("◎","回到位置","重新跟随孩子",true,()->{
+                    followChild=true;
+                    if(map!=null && latest!=null){
+                        String type=latest.optString("coordType","wgs84");
+                        if("wgs84".equals(type)||"gcj02".equals(type)){
+                            double lat=latest.optDouble("lat",Double.NaN),lon=latest.optDouble("lon",Double.NaN);
+                            if(Double.isFinite(lat)&&Double.isFinite(lon)){
+                                map.animateCamera(CameraUpdateFactory.newLatLngZoom(toAmapPoint(lat,lon,type),17f));
+                                mapCentered=true;
+                            }
+                        }
+                    }
+                },
+                "◉","定位详情","精度、卫星与坐标",false,()->new AlertDialog.Builder(this)
+                    .setTitle("定位数据与来源")
+                    .setMessage("附近地址："+resolvedAddress+"\n"+
+                            (latestDiagnostics.isEmpty()?"还没有收到有效位置":latestDiagnostics))
+                    .setNeutralButton("外部地图",(d,w)->openMap())
+                    .setPositiveButton("知道了",null).show());
+        // The map overlay itself explains the position; no duplicate instruction strip.
+        actionRow("▧","查看所有孩子","地图框选全部孩子",true,this::showAllChildren,
+                "♧","设备管理","添加孩子及设备操作",false,this::showDeviceManagement);
+        cardTitle("常用功能","");
+        actionRow("⌁","历史轨迹","最近 1 / 6 / 24 小时",false,this::showHistoryPicker,
+                "⬡","电子围栏","绘制与编辑安全区域",true,this::openFenceEditor);
+        historyStatus=text("",12,Color.rgb(92,110,137),false);add(historyStatus);
+        guardStatus=text("正在读取安全区域…",12,Color.rgb(92,110,137),false);add(guardStatus);
+        TextView eventLink=text("查看全部安全事件  ›",14,Color.rgb(37,105,198),true);
+        eventLink.setPadding(dp(8),dp(8),dp(8),dp(12));
+        eventLink.setOnClickListener(v->showGuardEventHistory());add(eventLink);
+        actionRow("▣","照片及音视频","发送协助请求",false,this::showAssistancePicker,
+                "▤","查看媒体","已发送的照片与录音",false,this::downloadLatestMedia);
+        mediaStatus=text("",12,Color.rgb(92,110,137),false);add(mediaStatus);
+        cardTitle("家庭设置","");
+        actionRow("♙","家庭成员","邀请监护人加入",false,this::showFamilyManagement,
+                "↻","检查更新","安装最新版本",false,()->UpdateManager.check(this,true));
+        actionRow("🔑","恢复密钥管理","仅创建家庭的家长可更换",false,this::rotateRecoveryKey,
+                "♢","通知设置","检查 SOS 通知权限",false,()->{
+                    if(Build.VERSION.SDK_INT>=33 &&
+                       checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED)
+                        requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},401);
+                    else startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            Uri.parse("package:"+getPackageName())));
+                });
+        TextView note=text("安全提示：恢复密钥请单独保存；其他家庭可直接创建，无需平台邀请码。",12,
+                Color.rgb(110,125,146),false);
+        note.setPadding(dp(7),dp(8),dp(7),dp(7));add(note);
+        fetchLatest();loadGuard();loadMediaList();
+    }
+
     private void showHistoryPicker(){
         new AlertDialog.Builder(this).setTitle("查看历史轨迹")
                 .setItems(new String[]{"最近 1 小时","最近 6 小时","最近 24 小时"},
@@ -432,6 +1023,8 @@ public class MainActivity extends Activity {
             askAmapConsent(this::openFenceEditor);return;
         }
         Intent i=new Intent(this,FenceMapActivity.class);
+        i.putExtra("childId",selectedChildId);
+        i.putExtra("childName",selectedChildName);
         if(latest!=null){
             double lat=latest.optDouble("lat",Double.NaN);
             double lon=latest.optDouble("lon",Double.NaN);
@@ -444,21 +1037,32 @@ public class MainActivity extends Activity {
     }
     private void fetchLatest(){
         if(!"parent".equals(Prefs.role(this))||loading)return;
+        fetchChildren();
         loading=true;
+        final String target=selectedChildId;
+        final String url=childPath("/v1/latest");
         network.execute(()->{
-            try {JSONObject result=Api.call(this,"GET","/v1/latest",null,Prefs.token(this));
+            try {JSONObject result=Api.call(this,"GET",url,null,Prefs.token(this));
                 runOnUiThread(()->{
+                    if(!target.equals(selectedChildId)){loading=false;return;}
                     latest=result.optJSONObject("point");
+                    selectedBattery=result.optInt("battery",-1);
                     long serverNow=result.optLong("serverTime",System.currentTimeMillis());
                     if(latest==null){
-                        if(marker!=null){marker.remove();marker=null;}
+                        // Other children's markers stay on the map even if this device has no fix.
+                        marker=familyMarkers.get(selectedChildId);
                         if(accuracyCircle!=null){accuracyCircle.remove();accuracyCircle=null;}
                         lastRenderedPointId="";mapCentered=false;
+                        addressedPoint=null;resolvedAddress="暂无有效位置";updateAddressDetails();
                     }
                     boolean paired=result.optBoolean("paired",false);
+                    parentPaired=paired;
+                    parentChildName=result.optString("childName","");
+                    selectedChildName=parentChildName;
+                    parentLastSeen=result.optLong("lastSeen",0L);
                     if(pairText!=null){
                         if(paired){Prefs.store(this).edit().remove("pair_code").remove("pair_expiry").apply();}
-                        pairText.setText(paired?"已绑定："+result.optString("childName"):displayedPairState());
+                        pairText.setText(paired?"当前查看："+result.optString("childName"):displayedPairState());
                     }
                     if(parentStatus!=null){
                         long seen=result.optLong("lastSeen",0),age=Math.max(0,serverNow-seen);
@@ -467,7 +1071,8 @@ public class MainActivity extends Activity {
                         else {
                             long ageOfFix=Math.max(0,Math.max(serverNow-latest.optLong("receivedAt",serverNow),
                                     serverNow-latest.optLong("deviceTime",0)));
-                            String freshness=ageOfFix<=10000?"实时（约 "+(ageOfFix/1000)+" 秒延迟）":ageOfFix<=30000?"延迟（约 "+(ageOfFix/1000)+" 秒）":"已过期（约 "+(ageOfFix/1000)+" 秒前），请勿视为实时";
+                            String freshness=ageOfFix<=10000?"实时（约 "+(ageOfFix/1000)+" 秒延迟）":ageOfFix<=30000?"延迟（约 "+(ageOfFix/1000)+" 秒）":
+                                    "最后已知位置（"+(ageOfFix/60000)+" 分钟前），非实时";
                             double err=latest.optDouble("accuracy",9999);
                             String quality=err<=5?"优秀":err<=15?"良好":err<=50?"一般":"较差 / 室内可能漂移";
                             int battery=result.optInt("battery",-1);
@@ -483,6 +1088,12 @@ public class MainActivity extends Activity {
                         }
                     }
                     if(latest!=null){
+                        // A marker must become visibly stale even when no new GPS point arrives.
+                        long positionAge=Math.max(0,serverNow-latest.optLong("deviceTime",0));
+                        if(marker!=null){
+                            marker.setTitle(positionAge>60000L?"最后已知位置（非实时）":"孩子最新位置");
+                            marker.setAlpha(positionAge>60000L?0.55f:1.0f);
+                        }
                         String id=latest.optString("id");
                         if(!id.equals(lastRenderedPointId)){
                             if(mapReady) {
@@ -495,6 +1106,8 @@ public class MainActivity extends Activity {
                             }
                         }
                     }
+                    retryMissingAddressForSelectedChild();
+                    refreshSelectedInfoWindow();
                     loading=false;
                     if(System.currentTimeMillis()-lastGuardLoad>7000){lastGuardLoad=System.currentTimeMillis();loadGuard();loadMediaList();}
                 });
@@ -502,7 +1115,8 @@ public class MainActivity extends Activity {
         });
     }
     private void loadHistory(int hours){
-        request(()->Api.call(this,"GET","/v1/history?hours="+hours,null,Prefs.token(this)),r->{
+        final String url=childPath("/v1/history?hours="+hours);
+        request(()->Api.call(this,"GET",url,null,Prefs.token(this)),r->{
             JSONArray items=r.optJSONArray("points");
             if(items==null)items=new JSONArray();
             if(historyStatus!=null)historyStatus.setText("最近 "+hours+" 小时历史坐标："+items.length()+" 个采样点");
@@ -529,14 +1143,23 @@ public class MainActivity extends Activity {
         });
     }
     private String time(long millis){if(millis==0)return "未知";return new SimpleDateFormat("MM-dd HH:mm:ss",Locale.CHINA).format(new Date(millis));}
-    private void openMap(){
-        if(latest==null){show("还没有位置记录");return;}
-        double lat=latest.optDouble("lat"),lon=latest.optDouble("lon");
-        String coords="gcj02".equals(latest.optString("coordType"))?"gaode":"wgs84";
-        String url=String.format(Locale.US,"https://uri.amap.com/marker?position=%.7f,%.7f&name=%%E5%%AE%%B6%%E5%%BA%%AD%%E5%%AE%%88%%E6%%8A%%A4&coordinate=%s&callnative=1",lon,lat,coords);
+    private void openMapForChild(String childId){
+        JSONObject fix=pointForChild(childId);
+        if(fix==null){show("还没有位置记录");return;}
+        double lat=fix.optDouble("lat",Double.NaN),lon=fix.optDouble("lon",Double.NaN);
+        if(!Double.isFinite(lat)||!Double.isFinite(lon)||Math.abs(lat)>90||Math.abs(lon)>180){
+            show("位置坐标无效");return;
+        }
+        String coords="gcj02".equals(fix.optString("coordType"))?"gaode":"wgs84";
+        JSONObject row=childRow(childId);
+        String name=row==null?"家庭守护":row.optString("childName","家庭守护");
+        String url=String.format(Locale.US,
+                "https://uri.amap.com/marker?position=%.7f,%.7f&name=%s&coordinate=%s&callnative=1",
+                lon,lat,Uri.encode(name),coords);
         try{startActivity(new Intent(Intent.ACTION_VIEW,Uri.parse(url)));}
         catch(Exception ex){show("无法打开地图："+ex.getMessage());}
     }
+    private void openMap(){openMapForChild(selectedChildId);}
     private void child(){
         title("孩子端 · 安全守护");
         childStatus=text(Prefs.isSharing(this)?"位置共享已开启（可随时停止）":"位置共享尚未开启",18,
@@ -616,9 +1239,142 @@ public class MainActivity extends Activity {
             else show("未授予精确定位权限，无法开始共享");
         }
     }
+    private void showDeviceManagement(){
+        request(()->Api.call(this,"GET","/v1/children",null,Prefs.token(this)),r->{
+            JSONArray children=r.optJSONArray("children");
+            List<String> options=new ArrayList<>();List<String> ids=new ArrayList<>();
+            if(children!=null)for(int i=0;i<children.length();i++){
+                JSONObject c=children.optJSONObject(i);if(c==null)continue;
+                options.add("查看 " + c.optString("childName","孩子") + (c.optString("childId").equals(selectedChildId)?"  ✓":""));
+                ids.add(c.optString("childId"));
+            }
+            options.add("＋ 添加孩子设备（最多8台）");
+            new AlertDialog.Builder(this).setTitle("家庭设备管理 · "+ids.size()+" 台")
+                    .setItems(options.toArray(new String[0]),(d,which)->{
+                        if(which<ids.size()){selectChild(ids.get(which));return;}
+                        request(()->Api.call(this,"POST","/v1/pair",new JSONObject(),Prefs.token(this)),result->{
+                            String code=result.optString("pairCode");saveDisplayedPairCode(code);
+                            new AlertDialog.Builder(this).setTitle("新孩子的配对码")
+                                .setMessage("请在新孩子手机输入："+code+"\n10分钟内有效，加入后会自动显示在家庭地图上。")
+                                .setPositiveButton("知道了",null).show();
+                        });
+                    }).setNegativeButton("取消",null).show();
+        });
+    }
+    private void rotateRecoveryKey(){
+        new AlertDialog.Builder(this).setTitle("更换家庭恢复密钥")
+            .setMessage("新密钥生成后旧密钥立即失效。只有家庭创建者能操作；务必另行备份新密钥。")
+            .setNegativeButton("取消",null)
+            .setPositiveButton("生成新密钥",(d,w)->request(
+                ()->Api.call(this,"POST","/v1/recovery-key",new JSONObject(),Prefs.token(this)),r->{
+                    showRecoveryKey(r.getString("recoveryKey"));
+                })).show();
+    }
+    private void showFamilyManagement(){
+        request(()->Api.call(this,"GET","/v1/members",null,Prefs.token(this)),r->{
+            JSONArray members=r.optJSONArray("members");boolean owner=r.optBoolean("owner",false);
+            StringBuilder list=new StringBuilder("家庭："+r.optString("familyName","我的家庭")+"\n家庭管理员：1人");
+            if(members!=null)for(int i=0;i<members.length();i++){
+                JSONObject m=members.optJSONObject(i);if(m!=null)list.append("\n监护人：").append(m.optString("name"));
+            }
+            AlertDialog.Builder dlg=new AlertDialog.Builder(this).setTitle("家庭成员")
+                .setMessage(list.toString()).setNegativeButton("关闭",null);
+            if(owner)dlg.setPositiveButton("邀请监护人",(d,w)->{
+                request(()->Api.call(this,"POST","/v1/members/invite",new JSONObject(),Prefs.token(this)),inv->{
+                    String code=inv.optString("inviteCode");
+                    new AlertDialog.Builder(this).setTitle("监护人邀请码")
+                        .setMessage("10分钟有效，发给需要加入的家长：\n"+code)
+                        .setPositiveButton("复制",(dd,ww)->{
+                            ((android.content.ClipboardManager)getSystemService(CLIPBOARD_SERVICE))
+                                .setPrimaryClip(ClipData.newPlainText("监护人邀请码",code));
+                        }).setNegativeButton("关闭",null).show();
+                });
+            });
+            dlg.show();
+        });
+    }
+    private void acknowledgeGuardEvent(String id){acknowledgeGuardEvent(id,selectedChildId);}
+    private void acknowledgeGuardEvent(String id,String childId){
+        final String url="/v1/guard/ack"+(childId==null||childId.isEmpty()?"":"?childId="+Uri.encode(childId));
+        request(()->Api.call(this,"POST",url,new JSONObject().put("id",id),Prefs.token(this)),
+            r->{show("已确认知晓安全事件");loadGuard();});
+    }
+    private void showGuardEventHistory(){
+        request(()->Api.call(this,"GET","/v1/guard/events",null,Prefs.token(this)),r->{
+            JSONArray all=r.optJSONArray("events");
+            if(all==null||all.length()==0){show("暂无安全事件");return;}
+            int n=Math.min(40,all.length());
+            String[] lines=new String[n];JSONObject[] items=new JSONObject[n];String[] childIDs=new String[n];
+            for(int i=0;i<n;i++){
+                JSONObject entry=all.optJSONObject(i);if(entry==null){lines[i]="未知记录";continue;}
+                JSONObject event=entry.optJSONObject("event");items[i]=event;
+                childIDs[i]=entry.optString("childId","");
+                if(event==null){lines[i]="未知记录";continue;}
+                String kind=event.optString("kind");
+                String status=GuardEventPolicy.isAlertKind(kind)?
+                    (event.optLong("acknowledgedAt")>0?"[已确认] ":"[待确认] "):"";
+                lines[i]=status+entry.optString("childName","孩子")+" · "+time(event.optLong("time"))+"\n"+
+                    event.optString("message",kind);
+            }
+            new AlertDialog.Builder(this).setTitle("全部孩子的安全事件 · 最近 "+n+" 条")
+                    .setItems(lines,(d,which)->{
+                        JSONObject event=items[which];if(event==null)return;
+                        AlertDialog.Builder detail=new AlertDialog.Builder(this).setTitle("安全事件详情")
+                            .setMessage(lines[which]);
+                        if(GuardEventPolicy.isAlertKind(event.optString("kind"))&&event.optLong("acknowledgedAt")==0){
+                            detail.setNegativeButton("稍后处理",null)
+                                .setPositiveButton("确认已知晓",(dd,ww)->acknowledgeGuardEvent(event.optString("id"),childIDs[which]));
+                        }else detail.setPositiveButton("返回",null);
+                        detail.show();
+                    }).setNegativeButton("关闭",null).show();
+        });
+    }
+    private void loadFamilyEvents(){
+        if(!started||!"parent".equals(Prefs.role(this))||familyEventsBusy||
+                System.currentTimeMillis()-lastFamilyEventFetch<5000L)return;
+        lastFamilyEventFetch=System.currentTimeMillis();familyEventsBusy=true;
+        network.execute(()->{
+            try{
+                JSONObject result=Api.call(this,"GET","/v1/guard/events",null,Prefs.token(this));
+                runOnUiThread(()->{
+                    familyEventsBusy=false;
+                    JSONArray all=result.optJSONArray("events");if(all==null)return;
+                    List<JSONObject> entries=new ArrayList<>();
+                    for(int i=0;i<all.length();i++){
+                        JSONObject entry=all.optJSONObject(i);if(entry==null)continue;
+                        JSONObject event=entry.optJSONObject("event");
+                        if(event!=null && event.optLong("acknowledgedAt",0)==0)entries.add(entry);
+                    }
+                    entries.sort((a,b)->{
+                        JSONObject x=a.optJSONObject("event"),y=b.optJSONObject("event");
+                        int diff=Integer.compare(GuardEventPolicy.priority(y==null?"":y.optString("kind")),
+                                GuardEventPolicy.priority(x==null?"":x.optString("kind")));
+                        return diff!=0?diff:Long.compare(y==null?0:y.optLong("time"),x==null?0:x.optLong("time"));
+                    });
+                    boolean dialogReserved=false;
+                    for(JSONObject entry:entries){
+                        JSONObject raw=entry.optJSONObject("event");if(raw==null)continue;
+                        String childId=entry.optString("childId"),childName=entry.optString("childName","孩子");
+                        try{
+                            JSONObject event=new JSONObject(raw.toString());
+                            event.put("message","【"+childName+"】"+raw.optString("message","安全事件"));
+                            boolean allowed=!dialogReserved && isWindowFocusedForAlert();
+                            boolean presented=ParentAlertNotifier.handle(this,event,allowed,
+                                    id->acknowledgeGuardEvent(id,childId));
+                            if(allowed&&presented)dialogReserved=true;
+                        }catch(org.json.JSONException e){android.util.Log.w("FamilyGuard","Cannot parse family event",e);}
+                    }
+                });
+            }catch(Exception e){runOnUiThread(()->{familyEventsBusy=false;android.util.Log.w("FamilyGuard","Family event refresh failed",e);});}
+        });
+    }
+    private boolean isWindowFocusedForAlert(){return !isFinishing() && hasWindowFocus();}
     private void loadGuard(){
         if(!started||!"parent".equals(Prefs.role(this)))return;
-        request(()->Api.call(this,"GET","/v1/guard",null,Prefs.token(this)),r->{
+        final String url=childPath("/v1/guard");
+        final String target=selectedChildId;
+        request(()->Api.call(this,"GET",url,null,Prefs.token(this)),r->{
+            if(!target.equals(selectedChildId))return;
             JSONObject f=r.optJSONObject("fence");
             org.json.JSONArray events=r.optJSONArray("events");
             StringBuilder b=new StringBuilder(f==null?"电子围栏：未开启":
@@ -628,24 +1384,31 @@ public class MainActivity extends Activity {
                 JSONObject last=events.optJSONObject(events.length()-1);
                 if(last!=null){b.append("\n最新提醒：").append(last.optString("message")).append(" · ").append(time(last.optLong("time")));
                     String id=last.optString("id");
-                    ParentAlertNotifier.handle(this,last);
                     lastGuardEvent=id;
                 }
             }
+            // New V7.3: alerts are aggregated across ALL children by loadFamilyEvents().
+            if(!r.optBoolean("pushConfigured",false))
+                b.append("\n后台推送：尚未配置。家长手机锁屏时不保证收到提醒，请勿仅依赖本 App 求助。");
+            else b.append("\n后台通知网关：已配置（是否送达仍需真机验证）");
             if(guardStatus!=null)guardStatus.setText(b.toString());
         });
     }
     private void askMedia(String kind){
         String label="photo".equals(kind)?"拍照":"audio".equals(kind)?"录音":"录像";
+        final String url=childPath("/v1/media/request");
         new AlertDialog.Builder(this).setTitle("请求孩子"+label+"？")
             .setMessage("孩子手机必须主动确认；不会秘密拍摄或录音。上传成功后家长可查看 24 小时。")
             .setNegativeButton("取消",null)
-            .setPositiveButton("发送请求",(d,w)->request(()->Api.call(this,"POST","/v1/media/request",
+            .setPositiveButton("发送请求",(d,w)->request(()->Api.call(this,"POST",url,
                 new JSONObject().put("kind",kind),Prefs.token(this)),r->{show("请求已发送，等待孩子确认");loadMediaList();})).show();
     }
     private void loadMediaList(){
         if(!started||!"parent".equals(Prefs.role(this)))return;
-        request(()->Api.call(this,"GET","/v1/media/list",null,Prefs.token(this)),r->{
+        final String target=selectedChildId;
+        final String url=childPath("/v1/media/list");
+        request(()->Api.call(this,"GET",url,null,Prefs.token(this)),r->{
+            if(!target.equals(selectedChildId))return;
             org.json.JSONArray entries=r.optJSONArray("media");
             if(entries==null||entries.length()==0){if(mediaStatus!=null)mediaStatus.setText("尚无媒体请求");return;}
             JSONObject item=entries.optJSONObject(entries.length()-1);
@@ -654,9 +1417,11 @@ public class MainActivity extends Activity {
         });
     }
     private void downloadLatestMedia(){
+        final String target=selectedChildId;
+        final String url=childPath("/v1/media/list");
         network.execute(()->{
             try{
-                JSONObject r=Api.call(this,"GET","/v1/media/list",null,Prefs.token(this));
+                JSONObject r=Api.call(this,"GET",url,null,Prefs.token(this));
                 org.json.JSONArray list=r.optJSONArray("media");JSONObject chosen=null;
                 if(list!=null)for(int i=list.length()-1;i>=0;i--){JSONObject item=list.optJSONObject(i);
                     if(item!=null&&"ready".equals(item.optString("status"))){chosen=item;break;}}
@@ -665,7 +1430,7 @@ public class MainActivity extends Activity {
                 String ext="image/jpeg".equals(mime)?".jpg":"audio/mp4".equals(mime)?".m4a":"video/3gpp".equals(mime)?".3gp":".mp4";
                 File folder=new File(getCacheDir(),"received");if(!folder.exists()&&!folder.mkdirs())throw new IOException("无法创建缓存目录");
                 File file=new File(folder,id+ext);
-                Api.download(this,id,file);
+                Api.download(this,id,file,target);
                 runOnUiThread(()->{
                     try{
                         Uri uri=FileProvider.getUriForFile(this,getPackageName()+".fileprovider",file);

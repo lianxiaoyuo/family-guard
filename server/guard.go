@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -29,12 +30,13 @@ type FenceVertex struct {
 	Lon float64 `json:"lon"`
 }
 type GuardEvent struct {
-	ID         string `json:"id"`
-	Kind       string `json:"kind"`
-	Message    string `json:"message"`
-	Time       int64  `json:"time"`
-	RequestID  string `json:"requestId,omitempty"`
-	OccurredAt int64  `json:"occurredAt,omitempty"`
+	ID             string `json:"id"`
+	Kind           string `json:"kind"`
+	Message        string `json:"message"`
+	Time           int64  `json:"time"`
+	RequestID      string `json:"requestId,omitempty"`
+	OccurredAt     int64  `json:"occurredAt,omitempty"`
+	AcknowledgedAt int64  `json:"acknowledgedAt,omitempty"` // An explicit action by the authenticated parent, not mere delivery
 }
 type MediaRequest struct {
 	ID          string `json:"id"`
@@ -50,6 +52,13 @@ func (f *Family) addGuardEvent(kind, msg string) {
 	if len(f.GuardEvents) > 512 {
 		f.GuardEvents = append([]GuardEvent(nil), f.GuardEvents[len(f.GuardEvents)-512:]...)
 	}
+}
+func validGuardEventID(id string) bool {
+	if len(id) != 16 {
+		return false
+	}
+	_, err := hex.DecodeString(id)
+	return err == nil
 }
 func validSOSID(id string) bool {
 	if len(id) != 36 {
@@ -93,7 +102,10 @@ func distanceMeters(a, b, c, d float64) float64 {
 // Called only after a strictly newer point passes validation. Uses hysteresis and
 // two consecutive positions to reduce the most common edge jitter false alerts.
 func (f *Family) evaluateFence(p Point, now int64) {
-	if f.Geofence == nil || p.DeviceTime < now-15000 || p.Accuracy > math.Max(40, f.Geofence.Radius*0.45) {
+	// A reported point may be inaccurate by its own uncertainty radius. Reject
+	// very coarse fixes outright and keep a margin larger than that uncertainty.
+	// Never infer a safe exit from a ±200m fix just 78m beyond a 500m circle.
+	if f.Geofence == nil || p.DeviceTime < now-15000 || p.Accuracy < 0 || p.Accuracy > 100 {
 		return
 	}
 	lat, lon := p.Lat, p.Lon
@@ -106,7 +118,7 @@ func (f *Family) evaluateFence(p Point, now int64) {
 	candidate := ""
 	if f.Geofence.Shape == "polygon" {
 		inside, border := polygonPosition(lat, lon, f.Geofence.Points)
-		margin := math.Min(40, math.Max(15, p.Accuracy))
+		margin := math.Max(20, p.Accuracy*1.5+10)
 		if border >= margin {
 			if inside {
 				candidate = "inside"
@@ -116,7 +128,7 @@ func (f *Family) evaluateFence(p Point, now int64) {
 		}
 	} else {
 		dist := distanceMeters(lat, lon, f.Geofence.Lat, f.Geofence.Lon)
-		margin := math.Min(40, math.Max(15, f.Geofence.Radius*0.2))
+		margin := math.Max(20, p.Accuracy*1.5+10)
 		if dist <= f.Geofence.Radius-margin {
 			candidate = "inside"
 		}
@@ -194,16 +206,98 @@ func mediaExt(mime string) string {
 	return ""
 }
 func registerGuardRoutes(mux *http.ServeMux, a *App) {
-	mux.HandleFunc("GET /v1/guard", func(w http.ResponseWriter, r *http.Request) {
+	// Aggregate safety events across all children within the authenticated family.
+	// A parent can never request another family's child using this endpoint.
+	mux.HandleFunc("GET /v1/guard/events", func(w http.ResponseWriter, r *http.Request) {
 		a.mu.RLock()
 		defer a.mu.RUnlock()
-		f := a.auth(r, "parent")
-		if f == nil {
+		root := a.auth(r, "parent")
+		if root == nil {
 			fail(w, 401, "unauthorized")
 			return
 		}
+		type entry struct {
+			ChildID   string     `json:"childId"`
+			ChildName string     `json:"childName"`
+			Event     GuardEvent `json:"event"`
+		}
+		all := make([]entry, 0, 64)
+		for _, f := range a.childrenLocked(root) {
+			for _, event := range f.GuardEvents {
+				all = append(all, entry{ChildID: f.ID, ChildName: f.ChildName, Event: event})
+			}
+		}
+		sort.SliceStable(all, func(i, j int) bool {
+			if all[i].Event.Time != all[j].Event.Time {
+				return all[i].Event.Time > all[j].Event.Time
+			}
+			return all[i].Event.ID < all[j].Event.ID
+		})
+		if len(all) > 100 {
+			all = all[:100]
+		}
+		write(w, 200, map[string]any{"events": all, "serverTime": time.Now().UnixMilli(),
+			"pushConfigured": strings.TrimSpace(os.Getenv("FG_ALERT_URL")) != "" && a.rootCountLocked() == 1})
+	})
+	mux.HandleFunc("GET /v1/guard", func(w http.ResponseWriter, r *http.Request) {
+		a.mu.RLock()
+		defer a.mu.RUnlock()
+		root := a.auth(r, "parent")
+		if root == nil {
+			fail(w, 401, "unauthorized")
+			return
+		}
+		f := a.selectChildLocked(root, r.URL.Query().Get("childId"))
+		if f == nil {
+			fail(w, 404, "child not in family")
+			return
+		}
 		events := append([]GuardEvent{}, f.GuardEvents...)
-		write(w, 200, map[string]any{"fence": f.Geofence, "events": events})
+		write(w, 200, map[string]any{"fence": f.Geofence, "events": events,
+			"pushConfigured": strings.TrimSpace(os.Getenv("FG_ALERT_URL")) != ""})
+	})
+	// Parent acknowledgement is durable and separate from an alert being shown
+	// on a device. Publishing the push event must not imply parent acknowledgement.
+	mux.HandleFunc("POST /v1/guard/ack", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ID string `json:"id"`
+		}
+		if err := decode(r, &body); err != nil || !validGuardEventID(body.ID) {
+			fail(w, 400, "invalid event id")
+			return
+		}
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		root := a.auth(r, "parent")
+		if root == nil {
+			fail(w, 401, "unauthorized")
+			return
+		}
+		f := a.selectChildLocked(root, r.URL.Query().Get("childId"))
+		if f == nil {
+			fail(w, 404, "child not in family")
+			return
+		}
+		i := -1
+		for k := range f.GuardEvents {
+			if f.GuardEvents[k].ID == body.ID {
+				i = k
+				break
+			}
+		}
+		if i < 0 {
+			fail(w, 404, "event not found")
+			return
+		}
+		if f.GuardEvents[i].AcknowledgedAt == 0 {
+			if err := a.withSavedFamily(f, func() {
+				f.GuardEvents[i].AcknowledgedAt = time.Now().UnixMilli()
+			}); err != nil {
+				fail(w, 500, "storage error")
+				return
+			}
+		}
+		write(w, 200, map[string]any{"ok": true, "acknowledgedAt": f.GuardEvents[i].AcknowledgedAt})
 	})
 	mux.HandleFunc("POST /v1/fence", func(w http.ResponseWriter, r *http.Request) {
 		var v struct {
@@ -225,9 +319,14 @@ func registerGuardRoutes(mux *http.ServeMux, a *App) {
 		}
 		a.mu.Lock()
 		defer a.mu.Unlock()
-		f := a.auth(r, "parent")
-		if f == nil {
+		root := a.auth(r, "parent")
+		if root == nil {
 			fail(w, 401, "unauthorized")
+			return
+		}
+		f := a.selectChildLocked(root, r.URL.Query().Get("childId"))
+		if f == nil {
+			fail(w, 404, "child not in family")
 			return
 		}
 		err := a.withSavedFamily(f, func() {
@@ -299,9 +398,14 @@ func registerGuardRoutes(mux *http.ServeMux, a *App) {
 		}
 		a.mu.Lock()
 		defer a.mu.Unlock()
-		f := a.auth(r, "parent")
-		if f == nil {
+		root := a.auth(r, "parent")
+		if root == nil {
 			fail(w, 401, "unauthorized")
+			return
+		}
+		f := a.selectChildLocked(root, r.URL.Query().Get("childId"))
+		if f == nil {
+			fail(w, 404, "child not in family")
 			return
 		}
 		if f.ChildHash == "" {
@@ -501,9 +605,14 @@ func registerGuardRoutes(mux *http.ServeMux, a *App) {
 	mux.HandleFunc("GET /v1/media/list", func(w http.ResponseWriter, r *http.Request) {
 		a.mu.RLock()
 		defer a.mu.RUnlock()
-		f := a.auth(r, "parent")
-		if f == nil {
+		root := a.auth(r, "parent")
+		if root == nil {
 			fail(w, 401, "unauthorized")
+			return
+		}
+		f := a.selectChildLocked(root, r.URL.Query().Get("childId"))
+		if f == nil {
+			fail(w, 404, "child not in family")
 			return
 		}
 		list := make([]MediaRequest, 0)
@@ -521,10 +630,16 @@ func registerGuardRoutes(mux *http.ServeMux, a *App) {
 			return
 		}
 		a.mu.RLock()
-		f := a.auth(r, "parent")
-		if f == nil {
+		root := a.auth(r, "parent")
+		if root == nil {
 			a.mu.RUnlock()
 			fail(w, 401, "unauthorized")
+			return
+		}
+		f := a.selectChildLocked(root, r.URL.Query().Get("childId"))
+		if f == nil {
+			a.mu.RUnlock()
+			fail(w, 404, "child not in family")
 			return
 		}
 		m := findMedia(f, id)
